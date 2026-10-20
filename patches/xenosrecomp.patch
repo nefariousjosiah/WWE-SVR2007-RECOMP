@@ -1,0 +1,522 @@
+diff --git a/XenosRecomp/legacy_container.h b/XenosRecomp/legacy_container.h
+new file mode 100644
+index 0000000..063d928
+--- /dev/null
++++ b/XenosRecomp/legacy_container.h
+@@ -0,0 +1,163 @@
++#pragma once
++
++// Shader containers of an older XDK version (flags 0x102A0Exx, SvR 2007) hold the same data as the
++// 0x102A11xx layout the rest of XenosRecomp reads, arranged differently:
++//   header (6 dwords): flags, virtualSize, physicalSize, definitionTableOffset,
++//     constantTableOffset, shaderOffset (0x11: 9 dwords, the constant table first);
++//   definitions: an empty physical float4 section (a lone 0), then inline entries
++//     {u16 address, u16 count, values[count]}: below 0x2320 a float4 literal at register
++//     (address - 0x300) / 16 (pixel shader registers 256 up, as 0x11 numbers them; count in
++//     dwords), from 0x2320 up an int4 as in 0x11;
++//   shader block: 0x11's physicalOffset and size are implied (the microcode is the whole physical
++//     part) and its next words come as field8, fieldC, field10, (unused), interpolatorInfo,
++//     (unused); a vertex shader has one more word (0) after field20, before its element list.
++// ConvertLegacyShaderContainer builds the 0x11 equivalent: header, constant table, definitions
++// (the float4 literals appended after the microcode, as physical data), shader block, microcode.
++// Checked against all 332 SvR 2007 shaders (tools/native/check07.py-style walk).
++
++#include <cstdint>
++#include <cstring>
++#include <vector>
++
++inline bool IsLegacyShaderContainer(const uint8_t* data)
++{
++    return (uint32_t(data[0]) << 24 | uint32_t(data[1]) << 16 | uint32_t(data[2]) << 8) == 0x102A0E00;
++}
++
++inline std::vector<uint8_t> ConvertLegacyShaderContainer(const uint8_t* src)
++{
++    auto rd = [&](uint32_t offset) -> uint32_t
++    {
++        const uint8_t* p = src + offset;
++        return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
++    };
++    std::vector<uint8_t> out;
++    auto wr = [&](uint32_t value)
++    {
++        out.push_back(uint8_t(value >> 24));
++        out.push_back(uint8_t(value >> 16));
++        out.push_back(uint8_t(value >> 8));
++        out.push_back(uint8_t(value));
++    };
++    auto patch = [&](size_t offset, uint32_t value)
++    {
++        out[offset] = uint8_t(value >> 24);
++        out[offset + 1] = uint8_t(value >> 16);
++        out[offset + 2] = uint8_t(value >> 8);
++        out[offset + 3] = uint8_t(value);
++    };
++
++    const uint32_t flags = rd(0x00);
++    const uint32_t virtualSize = rd(0x04);
++    const uint32_t physicalSize = rd(0x08);
++    const uint32_t definitionTableOffset = rd(0x0C);
++    const uint32_t constantTableOffset = rd(0x10);
++    const uint32_t shaderOffset = rd(0x14);
++    const bool isPixelShader = (flags & 0x1) == 0;
++
++    // Header, filled in at the end.
++    for (int i = 0; i < 9; i++)
++        wr(0);
++
++    // Constant table: a size, then that many bytes.
++    const size_t newConstantTable = out.size();
++    const uint32_t constantTableSize = rd(constantTableOffset);
++    out.insert(out.end(), src + constantTableOffset, src + constantTableOffset + 4 + constantTableSize);
++    while (out.size() % 4)
++        out.push_back(0);
++
++    // Definitions.
++    std::vector<uint32_t> literals;  // float4 literal values, appended after the microcode
++    size_t newDefinitionTable = 0;
++    if (definitionTableOffset != 0)
++    {
++        newDefinitionTable = out.size();
++        for (uint32_t i = 0; i < 4; i++)
++            wr(rd(definitionTableOffset + 4 * i));
++        const size_t sizeAt = out.size();
++        wr(0);
++        const size_t start = out.size();
++
++        const uint32_t size = rd(definitionTableOffset + 16);
++        const uint32_t first = definitionTableOffset + 20;
++        const uint32_t end = first + size;
++        uint32_t at = first;
++        std::vector<uint32_t> floats, ints;
++        // Physical float4 definitions (0x11 style), if any.
++        while (at + 8 <= end && rd(at) != 0)
++        {
++            floats.push_back(rd(at));
++            floats.push_back(rd(at + 4));
++            at += 8;
++        }
++        at += 4;
++        // Inline entries.
++        while (at + 4 <= end && rd(at) != 0)
++        {
++            const uint32_t header = rd(at);
++            const uint32_t address = header >> 16;
++            const uint32_t count = header & 0xFFFF;
++            if (address < 0x2320)
++            {
++                const uint32_t registerIndex = (address - 0x300) / 16;
++                floats.push_back(registerIndex << 16 | count);
++                floats.push_back(physicalSize + uint32_t(literals.size()) * 4);
++                for (uint32_t k = 0; k < count; k++)
++                    literals.push_back(rd(at + 4 + 4 * k));
++            }
++            else
++            {
++                ints.push_back(header);
++                for (uint32_t k = 0; k < count; k++)
++                    ints.push_back(rd(at + 4 + 4 * k));
++            }
++            at += 4 + 4 * count;
++        }
++        for (uint32_t v : floats)
++            wr(v);
++        wr(0);
++        for (uint32_t v : ints)
++            wr(v);
++        wr(0);
++        patch(sizeAt, uint32_t(out.size() - start));
++    }
++
++    // Shader block.
++    const size_t newShader = out.size();
++    const uint32_t blockWords = (virtualSize - shaderOffset) / 4;
++    auto block = [&](uint32_t i) { return i < blockWords ? rd(shaderOffset + 4 * i) : 0u; };
++    wr(0);             // physicalOffset: the microcode starts the physical part
++    wr(physicalSize);  // size
++    wr(block(0));      // field8
++    wr(block(1));      // fieldC
++    wr(block(2));      // field10
++    wr(block(4));      // interpolatorInfo
++    if (isPixelShader)
++    {
++        for (uint32_t i = 6; i < blockWords; i++)
++            wr(block(i));
++    }
++    else
++    {
++        wr(block(6));  // field18
++        wr(block(7));  // vertexElementCount
++        wr(block(8));  // field20
++        for (uint32_t i = 10; i < blockWords; i++)
++            wr(block(i));
++    }
++
++    // Physical part: the microcode, then the float4 literals.
++    const uint32_t newVirtualSize = uint32_t(out.size());
++    out.insert(out.end(), src + virtualSize, src + virtualSize + physicalSize);
++    for (uint32_t v : literals)
++        wr(v);
++
++    patch(0x00, (flags & 0xFFFF00FF) | 0x1100);
++    patch(0x04, newVirtualSize);
++    patch(0x08, uint32_t(out.size()) - newVirtualSize);
++    patch(0x0C, 0);
++    patch(0x10, uint32_t(newConstantTable));
++    patch(0x14, uint32_t(newDefinitionTable));
++    patch(0x18, uint32_t(newShader));
++    return out;
++}
+diff --git a/XenosRecomp/main.cpp b/XenosRecomp/main.cpp
+index 754198c..aca60d1 100644
+--- a/XenosRecomp/main.cpp
++++ b/XenosRecomp/main.cpp
+@@ -109,10 +109,11 @@ int main(int argc, char** argv)
+                 auto shaderContainer = reinterpret_cast<const ShaderContainer*>(fileData.get() + i);
+                 size_t dataSize = shaderContainer->virtualSize + shaderContainer->physicalSize;
+ 
+-                if ((shaderContainer->flags & 0xFFFFFF00) == 0x102A1100 &&
++                // 0x102A0Exx: older container version (SvR 2007), converted in recompile().
++                const bool legacy = (shaderContainer->flags & 0xFFFFFF00) == 0x102A0E00;
++                if (((shaderContainer->flags & 0xFFFFFF00) == 0x102A1100 || legacy) &&
+                     dataSize <= (fileSize - i) &&
+-                    shaderContainer->field1C == 0 &&
+-                    shaderContainer->field20 == 0)
++                    (legacy || (shaderContainer->field1C == 0 && shaderContainer->field20 == 0)))
+                 {
+                     XXH64_hash_t hash = XXH3_64bits(shaderContainer, dataSize);
+                     auto shader = shaders.try_emplace(hash);
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index 63c37c9..13e6683 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -3,6 +3,8 @@
+ 
+ #define SPEC_CONSTANT_R11G11B10_NORMAL  (1 << 0)
+ #define SPEC_CONSTANT_ALPHA_TEST        (1 << 1)
++// SvR 2008: normals/tangents packed as D3DDECLTYPE_DHEN3N (x 10 bits, y 11, z 11, signed).
++#define SPEC_CONSTANT_DHEN3N_NORMAL     (1 << 5)
+ 
+ #ifdef UNLEASHED_RECOMP
+     #define SPEC_CONSTANT_BICUBIC_GI_FILTER (1 << 2)
+@@ -12,18 +14,25 @@
+ 
+ // SPIR-V vertex input locations, shared with reblue's host input-layout
+ // builder. A semantic missing here gets no location from the emitter.
++// SvR 2008: every vertex input semantic its shaders use (POSITION/NORMAL 0-3 are morph targets),
++// plus Tangent/TexCoord2/Color1 as spares; exactly Vulkan's guaranteed 16 input locations.
+ #define REBLUE_VERTEX_INPUT_LOCATIONS(X) \
+-    X(Position,  0,  0) \
+-    X(Position,  1,  1) \
+-    X(Position,  2,  2) \
+-    X(Position,  3,  3) \
+-    X(Position,  4,  4) \
+-    X(Normal,    0,  5) \
+-    X(Tangent,   0,  6) \
+-    X(TexCoord,  0,  7) \
+-    X(TexCoord,  1,  8) \
+-    X(TexCoord,  2,  9) \
+-    X(Color,     0, 10)
++    X(Position,      0,  0) \
++    X(Position,      1,  1) \
++    X(Position,      2,  2) \
++    X(Position,      3,  3) \
++    X(Normal,        0,  4) \
++    X(Normal,        1,  5) \
++    X(Normal,        2,  6) \
++    X(Normal,        3,  7) \
++    X(BlendIndices,  0,  8) \
++    X(BlendWeight,   0,  9) \
++    X(TexCoord,      0, 10) \
++    X(TexCoord,      1, 11) \
++    X(Color,         0, 12) \
++    X(Tangent,       0, 13) \
++    X(TexCoord,      2, 14) \
++    X(Color,         1, 15)
+ 
+ // SPEC_CONSTANTS_ONLY keeps the HLSL below out of host C++ TUs, which IntelliSense would otherwise parse.
+ #if (!defined(__cplusplus) || defined(__INTELLISENSE__)) && !defined(SHADER_COMMON_SPEC_CONSTANTS_ONLY)
+@@ -55,6 +64,9 @@ struct PushConstants
+ #define g_SwappedPositions         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 320)
+ #define g_SintTexcoords            vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 324)
+ #define g_ShadowPcfScale           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 328)
++// SvR 2008: window-pixel to clip-space conversion for draws made with the viewport transform off
++// (D3DRS_VIEWPORTENABLE FALSE: the vertex shader outputs window pixels); identity otherwise.
++#define g_ScreenSpace              vk::RawBufferLoad<float4>(g_PushConstants.SharedConstants + 352)
+ #else
+ #define g_Booleans                 vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 256)
+ #define g_SwappedTexcoords         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 260)
+@@ -80,7 +92,8 @@ struct PushConstants
+     uint g_SwappedBlendWeights : packoffset(c19.w); \
+     uint g_SwappedPositions : packoffset(c20.x); \
+     uint g_SintTexcoords : packoffset(c20.y); \
+-    float g_ShadowPcfScale : packoffset(c20.z);
++    float g_ShadowPcfScale : packoffset(c20.z); \
++    float4 g_ScreenSpace : packoffset(c22);
+ 
+ #define g_Booleans(i) (g_BooleansArr[(i) / 4][(i) % 4])
+ #else
+@@ -100,6 +113,13 @@ uint g_SpecConstants();
+ #define BOOL_BIT(n) ((g_Booleans((n) / 32u) & (1u << ((n) & 31u))) != 0)
+ #endif
+ 
++// SvR 2008: texture fetches in vertex shaders sample mip 0 explicitly (no derivatives there).
++#ifdef SVR_VERTEX_SHADER
++#define SVR_SAMPLE(...) SampleLevel(__VA_ARGS__, 0)
++#else
++#define SVR_SAMPLE(...) Sample(__VA_ARGS__)
++#endif
++
+ Texture2D<float4> g_Texture2DDescriptorHeap[] : register(t0, space0);
+ Texture3D<float4> g_Texture3DDescriptorHeap[] : register(t0, space1);
+ TextureCube<float4> g_TextureCubeDescriptorHeap[] : register(t0, space2);
+@@ -115,7 +135,7 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
+ float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+ {
+     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+-    return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
++    return texture.SVR_SAMPLE(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
+ }
+ 
+ float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+@@ -208,17 +228,17 @@ float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex
+     float h1y = h1(fy);
+ 
+     float4 r =
+-        g0(fy) * (g0x * texture.Sample(samplerState, float2(px + h0x, py + h0y) / float2(dimensions)) +
+-            g1x * texture.Sample(samplerState, float2(px + h1x, py + h0y) / float2(dimensions))) +
+-        g1(fy) * (g0x * texture.Sample(samplerState, float2(px + h0x, py + h1y) / float2(dimensions)) +
+-            g1x * texture.Sample(samplerState, float2(px + h1x, py + h1y) / float2(dimensions)));
++        g0(fy) * (g0x * texture.SVR_SAMPLE(samplerState, float2(px + h0x, py + h0y) / float2(dimensions)) +
++            g1x * texture.SVR_SAMPLE(samplerState, float2(px + h1x, py + h0y) / float2(dimensions))) +
++        g1(fy) * (g0x * texture.SVR_SAMPLE(samplerState, float2(px + h0x, py + h1y) / float2(dimensions)) +
++            g1x * texture.SVR_SAMPLE(samplerState, float2(px + h1x, py + h1y) / float2(dimensions)));
+ 
+     return r;
+ }
+ 
+ float4 tfetch3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord)
+ {
+-    return g_Texture3DDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord);
++    return g_Texture3DDescriptorHeap[resourceDescriptorIndex].SVR_SAMPLE(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord);
+ }
+ 
+ struct CubeMapData
+@@ -236,13 +256,22 @@ struct CubeMapData
+ 
+ float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData)
+ {
+-    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z]);
++    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].SVR_SAMPLE(g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z]);
+ }
+ 
+ #ifdef REBLUE_RECOMP
+ // DEC3N normal decode; IA binds as R32_UINT so lane .x carries the raw bits (asuint recovers them).
+ float4 tfetchR11G11B10(float4 value)
+ {
++    if (g_SpecConstants() & SPEC_CONSTANT_DHEN3N_NORMAL)
++    {
++        uint v = asuint(value.x);
++        return float4(
++            (v & 0x00000200 ? -1.0 : 0.0) + ((v & 0x1FF) / 512.0),
++            (v & 0x00100000 ? -1.0 : 0.0) + (((v >> 10) & 0x3FF) / 1024.0),
++            (v & 0x80000000 ? -1.0 : 0.0) + (((v >> 21) & 0x3FF) / 1024.0),
++            0.0);
++    }
+     if (g_SpecConstants() & SPEC_CONSTANT_R11G11B10_NORMAL)
+     {
+         uint v = asuint(value.x);
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index feaa90b..9d52fe2 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -130,7 +130,14 @@ static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
+     { DeclUsage::TexCoord, 14 },
+     { DeclUsage::TexCoord, 15 },
+     { DeclUsage::Color, 0 },
+-    { DeclUsage::Color, 1 }
++    { DeclUsage::Color, 1 },
++#ifdef REBLUE_RECOMP
++    // SvR 2009 passes COLOR3/COLOR4 between its shaders (2008 only COLOR0/1). Both stages declare
++    // this whole list in the same order, so the extra slots link by position; 21 vec4 outputs.
++    { DeclUsage::Color, 2 },
++    { DeclUsage::Color, 3 },
++    { DeclUsage::Color, 4 },
++#endif
+ };
+ 
+ static constexpr std::string_view TEXTURE_DIMENSIONS[] = 
+@@ -140,6 +147,19 @@ static constexpr std::string_view TEXTURE_DIMENSIONS[] =
+     "Cube" 
+ };
+ 
++// SvR 2008: descriptor-index slots for samplers 0-31. Slots 0-15 keep re:Blue's layout at the start
++// of the shared constants; slots 16-31 (vertex texture fetch uses s16-s19) live at byte 384.
++static constexpr uint32_t SVR_SAMPLER_SLOTS = 32;
++static uint32_t svrTextureIndexOffset(size_t dimension, uint32_t reg)
++{
++    return reg < 16 ? uint32_t(dimension * 64 + reg * 4) : uint32_t(384 + dimension * 64 + (reg - 16) * 4);
++}
++static uint32_t svrSamplerIndexOffset(uint32_t reg)
++{
++    return reg < 16 ? uint32_t(std::size(TEXTURE_DIMENSIONS) * 64 + reg * 4)
++                    : uint32_t(384 + std::size(TEXTURE_DIMENSIONS) * 64 + (reg - 16) * 4);
++}
++
+ static FetchDestinationSwizzle getDestSwizzle(uint32_t dstSwizzle, uint32_t index)
+ {
+     return FetchDestinationSwizzle((dstSwizzle >> (index * 3)) & 0x7);
+@@ -199,15 +219,15 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+     switch (findResult->second.usage)
+     {
+     case DeclUsage::Normal:
+-        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL;
++        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL | SPEC_CONSTANT_DHEN3N_NORMAL;
+         print("tfetchR11G11B10(swapFloats(g_SwappedNormals, ");
+         break;
+     case DeclUsage::Tangent:
+-        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL;
++        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL | SPEC_CONSTANT_DHEN3N_NORMAL;
+         print("tfetchR11G11B10(swapFloats(g_SwappedTangents, ");
+         break;
+     case DeclUsage::Binormal:
+-        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL;
++        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL | SPEC_CONSTANT_DHEN3N_NORMAL;
+         print("tfetchR11G11B10(swapFloats(g_SwappedBinormals, ");
+         break;
+     case DeclUsage::BlendWeight:
+@@ -226,7 +246,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+     case DeclUsage::Normal:
+     case DeclUsage::Tangent:
+     case DeclUsage::Binormal:
+-        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL;
++        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL | SPEC_CONSTANT_DHEN3N_NORMAL;
+         print("tfetchR11G11B10(");
+         break;
+ 
+@@ -1275,16 +1295,28 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+ 
+ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_view& include)
+ {
++    // Older containers (SvR 2007, version 0x0E) are read through their 0x11 equivalent.
++    std::vector<uint8_t> converted;
++    if (IsLegacyShaderContainer(shaderData))
++    {
++        converted = ConvertLegacyShaderContainer(shaderData);
++        shaderData = converted.data();
++    }
+     const auto shaderContainer = reinterpret_cast<const ShaderContainer*>(shaderData);
+ 
+     assert((shaderContainer->flags & 0xFFFFFF00) == 0x102A1100);
+     assert(shaderContainer->constantTableOffset != NULL);
+ 
++    isPixelShader = (shaderContainer->flags & 0x1) == 0;
++
++    // SvR 2008: vertex shaders fetch textures too (vertex texture fetch); the shared helpers then
++    // use SampleLevel, since implicit-derivative Sample is pixel-shader only.
++    if (!isPixelShader)
++        out += "#define SVR_VERTEX_SHADER 1\n";
++
+     out += include;
+     out += '\n';
+ 
+-    isPixelShader = (shaderContainer->flags & 0x1) == 0;
+-
+     const auto constantTableContainer = reinterpret_cast<const ConstantTableContainer*>(shaderData + shaderContainer->constantTableOffset);
+     constantTableData = reinterpret_cast<const uint8_t*>(&constantTableContainer->constantTable);
+ 
+@@ -1368,11 +1400,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+             {
+                 println("#define {}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+-                    constantName, TEXTURE_DIMENSIONS[j], j * 64 + constantInfo->registerIndex * 4);
++                    constantName, TEXTURE_DIMENSIONS[j], svrTextureIndexOffset(j, constantInfo->registerIndex));
+             }
+ 
+             println("#define {}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+-                constantName, std::size(TEXTURE_DIMENSIONS) * 64 + constantInfo->registerIndex * 4);
++                constantName, svrSamplerIndexOffset(constantInfo->registerIndex));
+ 
+             samplers.emplace(constantInfo->registerIndex, constantName);
+             break;
+@@ -1383,17 +1415,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+ #ifdef REBLUE_RECOMP
+     // BD bodies reference unnamed sampler slots; emit fallback descriptor-index defines for any slot 0..15 the table didn't name.
+-    for (uint32_t r = 0; r < 16; r++)
++    for (uint32_t r = 0; r < SVR_SAMPLER_SLOTS; r++)
+     {
+         if (samplers.find(r) != samplers.end())
+             continue;
+         for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+         {
+             println("#define s{}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+-                r, TEXTURE_DIMENSIONS[j], j * 64 + r * 4);
++                r, TEXTURE_DIMENSIONS[j], svrTextureIndexOffset(j, r));
+         }
+         println("#define s{}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+-            r, std::size(TEXTURE_DIMENSIONS) * 64 + r * 4);
++            r, svrSamplerIndexOffset(r));
+     }
+ #endif
+ 
+@@ -1449,28 +1481,32 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+             for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+             {
++                uint32_t offset = svrTextureIndexOffset(j, constantInfo->registerIndex);
+                 println("\tuint {}_Texture{}DescriptorIndex : packoffset(c{}.{});",
+-                    constantName, TEXTURE_DIMENSIONS[j], j * 4 + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
++                    constantName, TEXTURE_DIMENSIONS[j], offset / 16, SWIZZLES[(offset % 16) / 4]);
+             }
+ 
++            uint32_t samplerOffset = svrSamplerIndexOffset(constantInfo->registerIndex);
+             println("\tuint {}_SamplerDescriptorIndex : packoffset(c{}.{});",
+-                constantName, 4 * std::size(TEXTURE_DIMENSIONS) + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
++                constantName, samplerOffset / 16, SWIZZLES[(samplerOffset % 16) / 4]);
+         }
+     }
+ 
+ #ifdef REBLUE_RECOMP
+     // Mirror the SPIR-V fallback: packoffset slots for any unnamed sampler index 0..15.
+-    for (uint32_t r = 0; r < 16; r++)
++    for (uint32_t r = 0; r < SVR_SAMPLER_SLOTS; r++)
+     {
+         if (samplers.find(r) != samplers.end())
+             continue;
+         for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+         {
++            uint32_t offset = svrTextureIndexOffset(j, r);
+             println("\tuint s{}_Texture{}DescriptorIndex : packoffset(c{}.{});",
+-                r, TEXTURE_DIMENSIONS[j], j * 4 + r / 4, SWIZZLES[r % 4]);
++                r, TEXTURE_DIMENSIONS[j], offset / 16, SWIZZLES[(offset % 16) / 4]);
+         }
++        uint32_t samplerOffset = svrSamplerIndexOffset(r);
+         println("\tuint s{}_SamplerDescriptorIndex : packoffset(c{}.{});",
+-            r, 4 * std::size(TEXTURE_DIMENSIONS) + r / 4, SWIZZLES[r % 4]);
++            r, samplerOffset / 16, SWIZZLES[(samplerOffset % 16) / 4]);
+     }
+ #endif
+ 
+@@ -2322,6 +2358,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                     if (!hasMtxProjection)
+                 #endif
+                     {
++                #ifdef REBLUE_RECOMP
++                        out += "\toPos.xy = oPos.xy * g_ScreenSpace.xy + g_ScreenSpace.zw * oPos.w;\n";
++                #endif
+                         out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
+                     }
+                 }
+diff --git a/XenosRecomp/shader_recompiler.h b/XenosRecomp/shader_recompiler.h
+index 791def7..7001989 100644
+--- a/XenosRecomp/shader_recompiler.h
++++ b/XenosRecomp/shader_recompiler.h
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include "legacy_container.h"
++
+ #include "shader.h"
+ #include "shader_code.h"
+ 

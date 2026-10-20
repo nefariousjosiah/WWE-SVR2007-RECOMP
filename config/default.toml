@@ -1,0 +1,78 @@
+# Codegen fixes for SvR 2007's default.xex (included from svr2007_manifest.toml [entrypoint]).
+# Every address in 2008's file was 2008-only; its copy is in config/reference_2008 for comparison.
+
+# Frame-rate mode (src/fps_hooks.cpp): with --svr_60fps the game stays in its 60 fps mode.
+# SetFrameRate(fps) (sub_824297D8): r3 = requested rate; 30/25 become 60/50.
+[[midasm_hook]]
+name = "SvrSetFrameRateHook"
+address = 0x824297D8
+registers = ["r3"]
+
+# "Drop to 30 fps mode" (sub_82429A30): skipped (returns immediately) when the hook returns true.
+[[midasm_hook]]
+name = "SvrSkip30ModeHook"
+address = 0x82429A30
+registers = []
+return_on_true = true
+
+# "Back to 60 (50) fps mode" (sub_82429AA8): the end of gameplay (src/fps_hooks.cpp).
+[[midasm_hook]]
+name = "SvrBack60ModeHook"
+address = 0x82429AA8
+registers = []
+
+# The game's swap function (sub_821EAB50) about to call VdSwap: once per presented frame.
+# src/fps_hooks.cpp counts frames for the on-screen FPS counter (F2).
+[[midasm_hook]]
+name = "SvrFrameSwapHook"
+address = 0x821EACDC
+registers = []
+
+# Loading: the loader's per-frame time slice (src/loading_hooks.cpp). At the budget compare in
+# sub_8242A088, f13 = budget in hundredths of a second; raised to svr_load_slice_ms.
+[[midasm_hook]]
+name = "SvrLoaderBudgetHook"
+address = 0x8242A0D0
+registers = ["f13"]
+
+# Cutscene captions (src/fps_hooks.cpp): the caption display update (sub_82227200) loads the
+# target fps (frame-rate struct +8) to turn caption times into 60ths; it sees 30 in the 60 fps mode.
+# Hide check, then show check.
+[[midasm_hook]]
+name = "SvrCaptionFpsHideHook"
+address = 0x82227254
+registers = ["r31"]
+after_instruction = true
+
+[[midasm_hook]]
+name = "SvrCaptionFpsShowHook"
+address = 0x822272A0
+registers = ["r30"]
+after_instruction = true
+
+# Loading (src/loading_hooks.cpp): the render loop (sub_82445240) right after it released the
+# device lock (call to sub_82429CE0 returns here); the frame limiter sleeps here.
+[[midasm_hook]]
+name = "SvrRenderLockReleasedHook"
+address = 0x82445450
+registers = []
+
+# Loading: the loader thread's loop (sub_821CBE18). 0x821CBE90 calls Sleep(r3 = 16) at the top of
+# each pass; 0x821CBEA0 runs only on a pass that found work.
+[[midasm_hook]]
+name = "SvrLoaderSleepHook"
+address = 0x821CBE90
+registers = ["r3"]
+
+[[midasm_hook]]
+name = "SvrLoaderWorkHook"
+address = 0x821CBEA0
+registers = []
+
+[functions]
+# Branch targets analysis left outside any function (codegen UnresolvedCall).
+0x824625F0 = {}   # b from 0x824649B0
+0x82462A00 = {}   # b from 0x824649C8
+0x825C50A8 = {}   # b from 0x825C59E4
+0x825E7B78 = {}   # b from 0x823DD4D8
+0x825D0840 = {}   # b from 0x825D08AC
