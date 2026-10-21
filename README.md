@@ -35,7 +35,9 @@ to run well on today's hardware.
   Direct3D 12 on Windows and Vulkan on Linux and the Steam Deck.
 - **60 fps, entrances and matches included:** the game normally drops to 30 for them; here it stays
   in its own 60 fps mode, so everything plays at the right speed. Cutscene subtitles stay in sync.
-- **Up to 4K:** 1440p on 1080p and 1440p screens, 4K on 4K screens, 720p on the Steam Deck.
+- **480p up to 8K:** Auto picks 1440p on 1080p and 1440p screens, 4K on 4K screens and 720p on the
+  Steam Deck; 480p helps weak graphics cards. The console's background blur (depth of field) is off
+  for a sharp image; it's a setting.
 - **Made for the Steam Deck:** 60 fps in entrances and matches; the arena screens' videos are decoded
   on their own thread so the busiest entrances stay smooth.
 - **Faster loading:** loading screens move quicker (the console paced its loading to the screen).
@@ -73,8 +75,8 @@ ID `31981C72`, about 7.8 GB).
 <details>
 <summary><b>Settings, controllers and keyboard</b></summary>
 
-- **The settings menu:** resolution (Auto, 720p, 1440p, 4K), graphics API (Auto, Direct3D 12,
-  Vulkan), fullscreen or window, 60 or 30 fps, screen shape, FPS counter, sound, **Language**,
+- **The settings menu:** resolution (Auto, 480p, 720p, 1080p, 1440p, 4K, 8K), graphics API (Auto, Direct3D 12,
+  Vulkan), fullscreen or window, 60 or 30 fps, screen shape, **Background blur**, FPS counter, sound, **Language**,
   keyboard controls, **Controllers**, CPU priority and updates. Saved in `svr2007.toml`.
 - **Language:** the game's text and menus in English or Italiano (the commentary is English only;
   the SvR 2007 disc has no other translations). Pick one and press A twice to restart straight into

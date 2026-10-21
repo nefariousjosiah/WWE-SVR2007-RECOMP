@@ -39,8 +39,12 @@
 
 #if defined(SVR_NATIVE_RENDERER)
 REXCVAR_DEFINE_BOOL(svr_edge_blur, false, "SvR",
-                    "SvR 2008's own edge-blur filter (the console's anti-aliasing): off keeps the image "
-                    "sharp; the higher internal resolution already smooths edges");
+                    "Edge-blur filter (the console's anti-aliasing). SvR 2007 has none: kept so the "
+                    "settings are the same in every game");
+// Applied in gpu/constant_buffers.cpp (the depth-of-field factor of the end-of-frame composites).
+REXCVAR_DEFINE_BOOL(svr_depth_of_field, false, "SvR",
+                    "SvR 2007's depth of field, which blurs the crowd and arena behind the wrestlers: "
+                    "off keeps the whole picture sharp");
 #endif
 #include "svr_hook.h"
 #include "svr_resources.h"
@@ -161,14 +165,7 @@ void DispatchDraw(u32 device_guest, u32 primitive_type, const char *name,
         return;
     }
   }
-  // SvR 2008's edge-blur post pass (pixel shader 0xF6E6390C10B93944; the same filter as SvR 2010's): a 3x3
-  // Sobel edge test that replaces every edge pixel with the average of its 9 neighbours. On the
-  // console that softened jaggies at 720p; here its 1-pixel 720p offsets are 2+ pixels at the
-  // internal resolution, so it blurs hair, tattoos, ropes and the crowd while the supersampling
-  // already smooths edges. Skipping the draw leaves the scene as rendered.
-  if (!REXCVAR_GET(svr_edge_blur) && s.pixel_shader && s.pixel_shader->shaderCacheEntry &&
-      s.pixel_shader->shaderCacheEntry->hash == 0xF6E6390C10B93944ull)
-    return;
+  // (SvR 2008-2010 skip their edge-blur post pass here; SvR 2007 has none.)
   // Vulkan has no "no index buffer" state: an indexed draw with none bound, or reaching past the
   // end of the bound one, can hang the GPU. Such a draw is skipped (and counted in the log).
   if (args.indexed && primitive_type != 13) {
@@ -191,8 +188,8 @@ void DispatchDraw(u32 device_guest, u32 primitive_type, const char *name,
   // the device (floats at +0x3160; SetRenderTarget/SetDepthStencilSurface reset it to the surface).
   if (const auto *dev = bd::mem::at<const bd::gpu::D3DDevice>(device_guest)) {
     const auto &vp = dev->viewport;
-    // Host targets are SvrRenderScale() times the guest's size.
-    const float k = float(bd::gpu::SvrRenderScale());
+    // Host targets are SvrRenderScale() times the guest's size (a fraction at 480p and 1080p).
+    const float k = bd::gpu::SvrRenderScale();
     bd::gpu::Video::SetDirtyValue<float>(s.dirtyStates.viewport, s.viewport.x, float(vp.X) * k);
     bd::gpu::Video::SetDirtyValue<float>(s.dirtyStates.viewport, s.viewport.y, float(vp.Y) * k);
     bd::gpu::Video::SetDirtyValue<float>(s.dirtyStates.viewport, s.viewport.width,

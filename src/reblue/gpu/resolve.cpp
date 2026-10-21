@@ -29,7 +29,7 @@
 namespace bd::gpu {
 
 #if defined(SVR_NATIVE_RENDERER)
-u32 SvrRenderScale();  // native/svr_resources.cpp: host targets are this many times the guest's size
+u32 SvrScaled(u32 guest);  // native/svr_resources.cpp: a guest coordinate at the internal resolution
 #endif
 
 namespace {
@@ -137,10 +137,11 @@ bool CopySurfaceToTextureLocked(VideoState &s, GuestTexture *src,
                              std::size(pre));
     src->layout = plume::RenderTextureLayout::COPY_SOURCE;
     dst->layout = plume::RenderTextureLayout::COPY_DEST;
-    // Host targets are SvrRenderScale() times the guest's size; the box stays inside the source.
-    const i32 k = i32(SvrRenderScale());
-    const i32 x0 = std::clamp(src_x * k, 0, i32(src->width) - i32(dst->width));
-    const i32 y0 = std::clamp(src_y * k, 0, i32(src->height) - i32(dst->height));
+    // The rectangle's corner at the internal resolution (SvrScaled); the box stays inside the source.
+    const i32 x0 = std::clamp(i32(SvrScaled(u32(std::max(src_x, 0)))), 0,
+                              i32(src->width) - i32(dst->width));
+    const i32 y0 = std::clamp(i32(SvrScaled(u32(std::max(src_y, 0)))), 0,
+                              i32(src->height) - i32(dst->height));
     const plume::RenderBox box(x0, y0, x0 + static_cast<int32_t>(dst->width),
                                y0 + static_cast<int32_t>(dst->height));
     s.command_list->copyTextureRegion(
