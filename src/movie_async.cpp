@@ -31,9 +31,11 @@
 #include <rex/system/xthread.h>
 #include <rex/types.h>
 
-REXCVAR_DEFINE_BOOL(svr_async_movies, true, "Game",
+// Off by default since v1.0.1: with it on, every video (intro, titantrons, menu backgrounds) showed
+// a double image on motion (issue #1). On again once that's fixed.
+REXCVAR_DEFINE_BOOL(svr_async_movies, false, "Game",
                     "Decode the arena screens' videos on their own thread (off: on the render "
-                    "thread, as the console did)");
+                    "thread, as the console did). Experimental: videos ghost on motion when on");
 
 REX_EXTERN(sub_821C9390);  // check the next frame buffer is free
 REX_EXTERN(sub_8270FB68);  // Bink: behind schedule?
