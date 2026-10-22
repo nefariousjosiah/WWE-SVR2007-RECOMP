@@ -101,6 +101,9 @@ ID `31981C72`, about 7.8 GB).
 | Start | Enter / X | | LT / RT | Q / E |
 | Back | Tab / Z | | Stick presses | F / K |
 
+Shift, Ctrl and Alt work as buttons too (for example Shift to run). A key bound on its own like
+that is no longer a modifier, so if you bind Shift, give the D-pad other keys.
+
 </details>
 
 ## Linux and Steam Deck (Proton): install and play
