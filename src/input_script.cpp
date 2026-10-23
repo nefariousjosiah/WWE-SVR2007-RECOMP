@@ -7,6 +7,14 @@
 // 150 ms. Presses are ORed into player 1's state (a missing controller reads as connected), so
 // the game's own code sees ordinary input and nothing reaches the desktop. Without the variable
 // the hook only forwards to the game's XInputGetState.
+//
+// Stopping early (either or both; the script stops at whichever comes first):
+//   SVR_INPUT_SCRIPT_STOP_MATCH=10   seconds after gameplay starts (entrance or match, the game's
+//                                    30 fps mode switch: SvrInGameplay, src/fps_hooks.cpp)
+//   SVR_INPUT_SCRIPT_STOP=300        seconds after the game first polled the pad
+// After stopping, a missing controller still reads as an idle connected one. During gameplay
+// START and BACK are left out of presses (they'd open the pause menu), so "START+A" gets
+// through the title screen and the menus and then only presses A in the entrance or match.
 
 #include <algorithm>
 #include <chrono>
@@ -20,6 +28,8 @@
 #include <rex/hook.h>
 #include <rex/logging.h>
 #include <rex/types.h>
+
+bool SvrInGameplay();  // src/fps_hooks.cpp
 
 namespace {
 
@@ -38,6 +48,15 @@ std::once_flag g_parse_once;
 std::chrono::steady_clock::time_point g_start;
 uint32_t g_packet_bump = 0;
 bool g_was_pressed = false;
+double g_stop_match = -1;  // seconds of gameplay before stopping; < 0: never
+double g_stop_total = -1;  // seconds since g_start before stopping; < 0: never
+double g_gameplay_since = -1;
+bool g_stopped = false;
+
+double EnvSeconds(const char *name) {
+  const char *env = std::getenv(name);
+  return env && *env ? std::atof(env) : -1;
+}
 
 uint16_t ButtonBit(const std::string &name, bool &lt, bool &rt) {
   if (name == "UP") return 0x0001;
@@ -92,7 +111,32 @@ void Parse() {
   }
   g_active = !g_presses.empty();
   g_start = std::chrono::steady_clock::now();
-  REXLOG_INFO("[input script] {} presses", g_presses.size());
+  g_stop_match = EnvSeconds("SVR_INPUT_SCRIPT_STOP_MATCH");
+  g_stop_total = EnvSeconds("SVR_INPUT_SCRIPT_STOP");
+  REXLOG_INFO("[input script] {} presses; stop {} s into gameplay, {} s total (< 0: never)",
+              g_presses.size(), g_stop_match, g_stop_total);
+}
+
+// Latches g_stopped once a stop condition is met.
+void CheckStop(double now) {
+  if (g_stopped)
+    return;
+  if (SvrInGameplay()) {
+    if (g_gameplay_since < 0) {
+      g_gameplay_since = now;
+      REXLOG_INFO("[input script] gameplay started at {:.1f} s", now);
+    }
+  } else {
+    g_gameplay_since = -1;
+  }
+  if (g_stop_match >= 0 && g_gameplay_since >= 0 && now - g_gameplay_since >= g_stop_match) {
+    g_stopped = true;
+    REXLOG_INFO("[input script] stopped at {:.1f} s, {:.1f} s into gameplay", now,
+                now - g_gameplay_since);
+  } else if (g_stop_total >= 0 && now >= g_stop_total) {
+    g_stopped = true;
+    REXLOG_INFO("[input script] stopped at {:.1f} s (time limit)", now);
+  }
 }
 
 }  // namespace
@@ -109,15 +153,18 @@ REX_HOOK_RAW(sub_82572C78) {
 
   const double now =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count();
+  CheckStop(now);
   uint16_t buttons = 0;
   bool lt = false, rt = false;
   for (const Press &p : g_presses) {
-    if (now >= p.at && now < p.at + kHoldSeconds) {
+    if (!g_stopped && now >= p.at && now < p.at + kHoldSeconds) {
       buttons |= p.buttons;
       lt |= p.lt;
       rt |= p.rt;
     }
   }
+  if (g_gameplay_since >= 0)
+    buttons &= uint16_t(~(0x0010 | 0x0020));  // START, BACK: the pause menu
   const bool pressed = buttons || lt || rt;
 
   // X_INPUT_STATE (big-endian): dwPacketNumber, wButtons, bLeftTrigger, bRightTrigger, thumbs.
