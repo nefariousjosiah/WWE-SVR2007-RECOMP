@@ -77,12 +77,15 @@ ID `31981C72`, about 7.8 GB).
 
 - **The settings menu:** resolution (Auto, 480p, 720p, 1080p, 1440p, 4K, 8K), graphics API (Auto, Direct3D 12,
   Vulkan), fullscreen or window, 60 or 30 fps, screen shape, **Background blur**, FPS counter, sound, **Language**,
-  keyboard controls, **Controllers**, CPU priority and updates. Saved in `svr2007.toml`.
+  **Unlock everything**, keyboard controls, **Controllers**, CPU priority and updates. Saved in `svr2007.toml`.
 - **Language:** the game's text and menus in English or Italiano (the commentary is English only;
   the SvR 2007 disc has no other translations). Pick one and press A twice to restart straight into
   it.
 - **Naming a superstar:** the on-screen keyboard works with a controller (A types, B deletes, X adds
   a space, Y switches case, Start finishes, Back cancels) or with your PC's keyboard.
+- **Unlock everything:** every superstar, arena, attire, move and other Shop item is available, as if
+  bought in the Shop. Best treated as permanent: switching it off brings back your own progress,
+  but rewards you earn while it's on are not saved.
 - **Controllers:** plug yours in before starting; each controller is its own player. Playing alone
   and the game says player 2 is disconnected, or your controller stops responding? A controller that
   reconnects, or shows up twice through Steam Input / DS4Windows / DSX, can become player 2: set

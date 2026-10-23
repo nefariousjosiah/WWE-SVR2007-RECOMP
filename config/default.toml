@@ -69,6 +69,14 @@ name = "SvrLoaderWorkHook"
 address = 0x821CBEA0
 registers = []
 
+# Unlock everything (src/unlock_all.cpp): the unlock check (sub_8253BEA0) has just computed its
+# answer in r3 (r31 = the item).
+[[midasm_hook]]
+name = "SvrUnlockAllHook"
+address = 0x8253BEE4
+registers = ["r3", "r31"]
+after_instruction = true
+
 [functions]
 # Branch targets analysis left outside any function (codegen UnresolvedCall).
 0x824625F0 = {}   # b from 0x824649B0
