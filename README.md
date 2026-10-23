@@ -76,7 +76,7 @@ ID `31981C72`, about 7.8 GB).
 <summary><b>Settings, controllers and keyboard</b></summary>
 
 - **The settings menu:** resolution (Auto, 480p, 720p, 1080p, 1440p, 4K, 8K), graphics API (Auto, Direct3D 12,
-  Vulkan), fullscreen or window, 60 or 30 fps, screen shape, **Background blur**, FPS counter, sound, **Language**,
+  Vulkan), fullscreen or window, 60 or 30 fps, **Screen shape**, **Background blur**, FPS counter, sound, **Language**,
   **Unlock everything**, keyboard controls, **Controllers**, CPU priority and updates. Saved in `svr2007.toml`.
 - **Language:** the game's text and menus in English or Italiano (the commentary is English only;
   the SvR 2007 disc has no other translations). Pick one and press A twice to restart straight into
@@ -86,6 +86,9 @@ ID `31981C72`, about 7.8 GB).
 - **Unlock everything:** every superstar, arena, attire, move and other Shop item is available, as if
   bought in the Shop. Best treated as permanent: switching it off brings back your own progress,
   but rewards you earn while it's on are not saved.
+- **Screen shape (experimental):** 16:10 (Steam Deck, many laptops), 21:9 and 32:9 (ultrawide).
+  Gameplay fills the screen (matches, entrances and cutscenes show more of the arena, nothing
+  stretched, the HUD in its usual place); menus stay 16:9 for now.
 - **Controllers:** plug yours in before starting; each controller is its own player. Playing alone
   and the game says player 2 is disconnected, or your controller stops responding? A controller that
   reconnects, or shows up twice through Steam Input / DS4Windows / DSX, can become player 2: set
