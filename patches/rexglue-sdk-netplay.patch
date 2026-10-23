@@ -415,14 +415,18 @@ index 0000000..5c169b4
 +
 +}  // namespace rex::system
 diff --git a/src/kernel/xam/apps/xgi_app.cpp b/src/kernel/xam/apps/xgi_app.cpp
-index 2b222da..e20d60b 100644
+index 2b222da..7d53424 100644
 --- a/src/kernel/xam/apps/xgi_app.cpp
 +++ b/src/kernel/xam/apps/xgi_app.cpp
-@@ -9,10 +9,20 @@
+@@ -9,10 +9,24 @@
   * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
   */
  
++#include <algorithm>
++#include <cstring>
++#include <mutex>
 +#include <string>
++#include <vector>
 +
 +#include <fmt/format.h>
 +
@@ -439,7 +443,7 @@ index 2b222da..e20d60b 100644
  namespace rex {
  namespace kernel {
  namespace xam {
-@@ -23,6 +33,218 @@ using namespace rex::system;
+@@ -23,6 +37,275 @@ using namespace rex::system;
  
  XgiApp::XgiApp(KernelState* kernel_state) : App(kernel_state, 0xFB) {}
  
@@ -550,6 +554,46 @@ index 2b222da..e20d60b 100644
 +  return out.empty() ? "none" : out;
 +}
 +
++// Xbox LIVE returns each result with the attributes the query asked for: the ids the title
++// searched with, in its order. A host's own list can hold more (presence, system properties), and
++// titles read results by that shape, so a result carries the query's ids with the host's values
++// (zero where the host never set one). A search with no attributes gets the host's list as is.
++struct ResultAttributes {
++  std::vector<SessionContext> contexts;
++  std::vector<SessionProperty> properties;
++};
++
++ResultAttributes ShapeResult(const SessionAdvert& advert, const std::vector<uint32_t>& query_contexts,
++                             const std::vector<uint32_t>& query_properties) {
++  ResultAttributes out;
++  if (query_contexts.empty() && query_properties.empty()) {
++    out.contexts = advert.contexts;
++    out.properties = advert.properties;
++    return out;
++  }
++  for (uint32_t id : query_contexts) {
++    SessionContext context{id, 0};
++    for (const auto& have : advert.contexts) {
++      if (have.id == id) {
++        context.value = have.value;
++      }
++    }
++    out.contexts.push_back(context);
++  }
++  for (uint32_t id : query_properties) {
++    SessionProperty property;
++    property.id = id;
++    property.type = PropertyType(id);
++    for (const auto& have : advert.properties) {
++      if (have.id == id) {
++        property = have;
++      }
++    }
++    out.properties.push_back(property);
++  }
++  return out;
++}
++
 +// XSessionSearch / XSessionSearchEx (same first 32 bytes): asks the hosts on
 +// this LAN, this PC and net_host_ip, and writes what they advertise.
 +X_HRESULT SearchSessions(const char* name, uint8_t* buffer, uint32_t buffer_length,
@@ -595,12 +639,26 @@ index 2b222da..e20d60b 100644
 +                             }),
 +              found.end());
 +
++  std::vector<uint32_t> query_contexts, query_properties;
++  for (uint32_t i = 0; ctx_ptr && i < num_ctx && i < 64; ++i) {
++    query_contexts.push_back(
++        memory::load_and_swap<uint32_t>(memory->TranslateVirtual(ctx_ptr + i * kUserContextSize)));
++  }
++  for (uint32_t i = 0; props_ptr && i < num_props && i < 64; ++i) {
++    query_properties.push_back(memory::load_and_swap<uint32_t>(
++        memory->TranslateVirtual(props_ptr + i * kUserPropertySize)));
++  }
++  std::vector<ResultAttributes> shaped;
++  for (const auto& f : found) {
++    shaped.push_back(ShapeResult(f.advert, query_contexts, query_properties));
++  }
++
 +  // Results first, then each result's properties and contexts.
 +  uint32_t count = 0;
 +  uint32_t needed = kHeaderSize;
-+  for (const auto& f : found) {
-+    uint32_t size = kSearchResultSize + uint32_t(f.advert.contexts.size()) * kUserContextSize +
-+                    uint32_t(f.advert.properties.size()) * kUserPropertySize;
++  for (size_t n = 0; n < found.size(); ++n) {
++    uint32_t size = kSearchResultSize + uint32_t(shaped[n].contexts.size()) * kUserContextSize +
++                    uint32_t(shaped[n].properties.size()) * kUserPropertySize;
 +    if (count >= max_results || needed + size > results_size) {
 +      break;
 +    }
@@ -615,24 +673,25 @@ index 2b222da..e20d60b 100644
 +  memory::store_and_swap<uint32_t>(header + 4, count ? first_result : 0);
 +  for (uint32_t i = 0; i < count; ++i) {
 +    const auto& a = found[i].advert;
++    const auto& attrs = shaped[i];
 +    auto r = memory->TranslateVirtual(first_result + i * kSearchResultSize);
 +    std::memcpy(r, a.session_info.data(), kSessionInfoSize);
 +    memory::store_and_swap<uint32_t>(r + 60, a.open_public);
 +    memory::store_and_swap<uint32_t>(r + 64, a.open_private);
 +    memory::store_and_swap<uint32_t>(r + 68, a.filled_public);
 +    memory::store_and_swap<uint32_t>(r + 72, a.filled_private);
-+    memory::store_and_swap<uint32_t>(r + 76, uint32_t(a.properties.size()));
-+    memory::store_and_swap<uint32_t>(r + 80, uint32_t(a.contexts.size()));
-+    const uint32_t props_va = a.properties.empty() ? 0 : extra;
-+    for (const auto& prop : a.properties) {
++    memory::store_and_swap<uint32_t>(r + 76, uint32_t(attrs.properties.size()));
++    memory::store_and_swap<uint32_t>(r + 80, uint32_t(attrs.contexts.size()));
++    const uint32_t props_va = attrs.properties.empty() ? 0 : extra;
++    for (const auto& prop : attrs.properties) {
 +      auto p = memory->TranslateVirtual(extra);
 +      memory::store_and_swap<uint32_t>(p, prop.id);
 +      p[8] = prop.type;
 +      std::memcpy(p + kUserDataValueOffset, prop.value.data(), 8);
 +      extra += kUserPropertySize;
 +    }
-+    const uint32_t ctx_va = a.contexts.empty() ? 0 : extra;
-+    for (const auto& ctx : a.contexts) {
++    const uint32_t ctx_va = attrs.contexts.empty() ? 0 : extra;
++    for (const auto& ctx : attrs.contexts) {
 +      auto c = memory->TranslateVirtual(extra);
 +      memory::store_and_swap<uint32_t>(c, ctx.id);
 +      memory::store_and_swap<uint32_t>(c + 4, ctx.value);
@@ -640,9 +699,11 @@ index 2b222da..e20d60b 100644
 +    }
 +    memory::store_and_swap<uint32_t>(r + 84, props_va);
 +    memory::store_and_swap<uint32_t>(r + 88, ctx_va);
-+    REXKRNL_INFO("[net] {}: result {} = session {:016X} hosted by '{}' ({}/{} public open)", name,
-+                 i, a.session_id(), a.host_gamertag, a.open_public,
-+                 a.open_public + a.filled_public);
++    REXKRNL_INFO("[net] {}: result {} = session {:016X} hosted by '{}' ({}/{} public open); "
++                 "{} contexts, {} properties (host set {} and {})",
++                 name, i, a.session_id(), a.host_gamertag, a.open_public,
++                 a.open_public + a.filled_public, attrs.contexts.size(), attrs.properties.size(),
++                 a.contexts.size(), a.properties.size());
 +  }
 +  if (count < found.size()) {
 +    REXKRNL_WARN("[net] {}: {} of {} sessions fit (max {} results, {} byte buffer)", name, count,
@@ -658,7 +719,7 @@ index 2b222da..e20d60b 100644
  // http://mb.mirage.org/bugzilla/xliveless/main.c
  
  X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
-@@ -42,6 +264,16 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -42,6 +325,16 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        uint32_t context_value = memory::load_and_swap<uint32_t>(buffer + 20);
        REXKRNL_DEBUG("XGIUserSetContextEx({:08X}, {:08X}, {:08X})", user_index, context_id,
                      context_value);
@@ -675,7 +736,7 @@ index 2b222da..e20d60b 100644
        return X_E_SUCCESS;
      }
      case 0x000B0007: {
-@@ -51,6 +283,25 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -51,6 +344,25 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        uint32_t value_ptr = memory::load_and_swap<uint32_t>(buffer + 24);
        REXKRNL_DEBUG("XGIUserSetPropertyEx({:08X}, {:08X}, {}, {:08X})", user_index, property_id,
                      value_size, value_ptr);
@@ -701,7 +762,7 @@ index 2b222da..e20d60b 100644
        return X_E_SUCCESS;
      }
      case 0x000B0008: {
-@@ -113,6 +364,30 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -113,6 +425,30 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
            "{:08X})",
            session_ptr, flags, num_slots_public, num_slots_private, user_xuid, session_info_ptr,
            nonce_ptr);
@@ -732,7 +793,7 @@ index 2b222da..e20d60b 100644
        return X_E_SUCCESS;
      }
      case 0x000B0011: {
-@@ -123,6 +398,10 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -123,6 +459,10 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        uint64_t session_nonce = memory::load_and_swap<uint64_t>(buffer + 8);
  
        REXKRNL_DEBUG("XGISessionDelete({:08X}, {:08X}, {:016X})", obj_ptr, flags, session_nonce);
@@ -743,7 +804,7 @@ index 2b222da..e20d60b 100644
  
        return X_E_SUCCESS;
      }
-@@ -138,6 +417,12 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -138,6 +478,12 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        REXKRNL_DEBUG("{}({:08X}, {}, {}, {:08X}, {:08X})",
                      is_local ? "XGISessionJoinLocal" : "XGISessionJoinRemote", session_ptr,
                      user_count, xuid_array_ptr, user_index_array, private_slots_array);
@@ -756,7 +817,7 @@ index 2b222da..e20d60b 100644
        return X_E_SUCCESS;
      }
      case 0x000B0014: {
-@@ -179,7 +464,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -179,7 +525,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        REXKRNL_DEBUG("XSessionSearch({}, {}, {}, {}, {}, {:08X}, {:08X}, {}, {:08X})", proc_index,
                      user_index, num_results, num_props, num_ctx, props_ptr, ctx_ptr,
                      results_buffer_size, search_results_ptr);
@@ -765,7 +826,7 @@ index 2b222da..e20d60b 100644
      }
      case 0x000B0018: {
        assert_true(!buffer_length || buffer_length == 16);
-@@ -194,28 +479,6 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -194,28 +540,6 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
  
        return X_E_SUCCESS;
      }
@@ -794,7 +855,7 @@ index 2b222da..e20d60b 100644
      case 0x000B001D: {
        assert_true(!buffer_length || buffer_length == 24);
  
-@@ -445,6 +708,15 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -445,6 +769,15 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        REXKRNL_DEBUG("XGI 0x000B0071, unimplemented");
        return X_E_SUCCESS;
      }
