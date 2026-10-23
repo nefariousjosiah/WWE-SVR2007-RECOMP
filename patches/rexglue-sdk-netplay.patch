@@ -174,10 +174,10 @@ index ec37017..72cdcfd 100644
  }  // namespace rex
 diff --git a/include/rex/system/xnet_address_table.h b/include/rex/system/xnet_address_table.h
 new file mode 100644
-index 0000000..7ed255f
+index 0000000..c850eb8
 --- /dev/null
 +++ b/include/rex/system/xnet_address_table.h
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,119 @@
 +/**
 + * @file        system/xnet_address_table.h
 + * @brief       Maps XNet peers to opaque guest IN_ADDRs and real UDP endpoints
@@ -274,10 +274,20 @@ index 0000000..7ed255f
 +  // guest port of the receiving socket; it disambiguates several peers that
 +  // share one IP (instances on the same host) since titles typically use the
 +  // same game port on every peer. Unknown sources pass through.
-+  XNetEndpoint FromWire(XNetEndpoint wire, uint16_t local_guest_port) const;
++  //
++  // A source we have no entry for is given one, as XNet does for a peer that connects to us: a
++  // host learns of a joiner from its first packet, and the title then asks for its XNADDR
++  // (XNetInAddrToXnAddr). The peer's port offset follows from its source port, since titles use
++  // the same game port everywhere. Packets that don't fit (a DNS reply, say) pass through, and
++  // a packet that looks like our own address and offset is never matched to ourselves.
++  XNetEndpoint FromWire(XNetEndpoint wire, uint16_t local_guest_port);
 +
 + private:
 +  static uint16_t ShiftPort(uint16_t port, int32_t offset);
++  // Register with mutex_ held.
++  uint32_t RegisterLocked(const XNetPeer& peer);
++  // Peers with offsets from 0 up to this are taken as instances of the title on that host.
++  static constexpr int32_t kMaxAutoOffset = 15;
 +
 +  mutable std::mutex mutex_;
 +  int32_t local_port_offset_ = 0;
@@ -2544,10 +2554,10 @@ index a77f5e6..d774a31 100644
    std::swap(settings_[setting->setting_id], previous_setting);
 diff --git a/src/system/xnet_address_table.cpp b/src/system/xnet_address_table.cpp
 new file mode 100644
-index 0000000..0c427e6
+index 0000000..e2d65f2
 --- /dev/null
 +++ b/src/system/xnet_address_table.cpp
-@@ -0,0 +1,147 @@
+@@ -0,0 +1,165 @@
 +/**
 + * @file        system/xnet_address_table.cpp
 + * @brief       XNet peer address mapping
@@ -2579,6 +2589,10 @@ index 0000000..0c427e6
 +
 +uint32_t XNetAddressTable::Register(const XNetPeer& peer) {
 +  std::lock_guard<std::mutex> lock(mutex_);
++  return RegisterLocked(peer);
++}
++
++uint32_t XNetAddressTable::RegisterLocked(const XNetPeer& peer) {
 +  std::optional<size_t> free_slot;
 +  for (size_t i = 0; i < peers_.size(); ++i) {
 +    if (peers_[i] == peer) {
@@ -2669,7 +2683,7 @@ index 0000000..0c427e6
 +  return {ip, ShiftPort(guest.port, peer->port_offset)};
 +}
 +
-+XNetEndpoint XNetAddressTable::FromWire(XNetEndpoint wire, uint16_t local_guest_port) const {
++XNetEndpoint XNetAddressTable::FromWire(XNetEndpoint wire, uint16_t local_guest_port) {
 +  std::lock_guard<std::mutex> lock(mutex_);
 +  // A sender on this PC arrives over loopback; its registered address is our own.
 +  const uint32_t wire_ip = (local_ip_ && wire.ip == kLoopback) ? local_ip_ : wire.ip;
@@ -2678,6 +2692,10 @@ index 0000000..0c427e6
 +  for (size_t i = 0; i < peers_.size(); ++i) {
 +    const auto& peer = peers_[i];
 +    if (!peer || peer->ip != wire_ip) {
++      continue;
++    }
++    // Our own entry (a host registers itself) is never the sender.
++    if (local_ip_ && peer->ip == local_ip_ && peer->port_offset == local_port_offset_) {
 +      continue;
 +    }
 +    uint16_t guest_port = ShiftPort(wire.port, -peer->port_offset);
@@ -2690,6 +2708,16 @@ index 0000000..0c427e6
 +  if (match_count == 1) {
 +    return {kVirtualPrefix | uint32_t(*only_match + 1),
 +            ShiftPort(wire.port, -peers_[*only_match]->port_offset)};
++  }
++  if (match_count == 0 && local_guest_port && wire_ip) {
++    const int32_t offset = int32_t(wire.port) - int32_t(local_guest_port);
++    const bool is_self = local_ip_ && wire_ip == local_ip_ && offset == local_port_offset_;
++    if (offset >= 0 && offset <= kMaxAutoOffset && !is_self) {
++      uint32_t virtual_ip = RegisterLocked({wire_ip, offset});
++      if (virtual_ip) {
++        return {virtual_ip, local_guest_port};
++      }
++    }
 +  }
 +  return wire;
 +}
@@ -3352,10 +3380,10 @@ index 0000000..85cd7a5
 +}
 diff --git a/tests/unit/system/xnet_address_table_test.cpp b/tests/unit/system/xnet_address_table_test.cpp
 new file mode 100644
-index 0000000..10b5fc3
+index 0000000..74a2023
 --- /dev/null
 +++ b/tests/unit/system/xnet_address_table_test.cpp
-@@ -0,0 +1,166 @@
+@@ -0,0 +1,215 @@
 +/**
 + * Unit tests for XNetAddressTable
 + *
@@ -3492,17 +3520,19 @@ index 0000000..10b5fc3
 +}
 +
 +TEST_CASE("A loopback sender maps back to the same-PC peer", "[xnet]") {
++  // We are instance 1; the peer is instance 0 on the same PC.
 +  XNetAddressTable table;
 +  table.SetLocalIp(kLanA);
++  table.SetLocalPortOffset(1);
 +  uint32_t same_pc = table.Register({kLanA, 0});
 +
-+  CHECK(table.FromWire({XNetAddressTable::kLoopback, kGamePort}, kGamePort) ==
++  CHECK(table.FromWire({XNetAddressTable::kLoopback, kGamePort}, kGamePort - 0) ==
 +        XNetEndpoint{same_pc, kGamePort});
-+  // Without a local address set, loopback is just another unknown source.
++  // Without a local address set, a loopback sender is just another host to learn.
 +  XNetAddressTable plain;
-+  plain.Register({kLanA, 0});
-+  CHECK(plain.FromWire({XNetAddressTable::kLoopback, kGamePort}, kGamePort) ==
-+        XNetEndpoint{XNetAddressTable::kLoopback, kGamePort});
++  XNetEndpoint seen = plain.FromWire({XNetAddressTable::kLoopback, kGamePort}, kGamePort);
++  CHECK(XNetAddressTable::IsVirtual(seen.ip));
++  CHECK(plain.Lookup(seen.ip) == XNetPeer{XNetAddressTable::kLoopback, 0});
 +}
 +
 +TEST_CASE("Two instances on one PC talk over loopback", "[xnet]") {
@@ -3521,6 +3551,53 @@ index 0000000..10b5fc3
 +  // B receives it from A's bind port, over loopback, and sees A's virtual address.
 +  CHECK(b.FromWire({XNetAddressTable::kLoopback, a.HostBindPort(kGamePort)}, kGamePort) ==
 +        XNetEndpoint{a_seen_by_b, kGamePort});
++}
++
++TEST_CASE("An unknown sender gets its own address, never ours", "[xnet]") {
++  // A host registers itself (its own XNADDR); a joiner on the same PC then sends from
++  // loopback with offset 1. It must not be mistaken for the host.
++  XNetAddressTable host;
++  host.SetLocalIp(kLanA);
++  host.SetLocalPortOffset(0);
++  uint32_t self = host.Register({kLanA, 0});
++
++  XNetEndpoint seen = host.FromWire({XNetAddressTable::kLoopback, kGamePort + 1}, kGamePort);
++  CHECK(seen.ip != self);
++  CHECK(XNetAddressTable::IsVirtual(seen.ip));
++  CHECK(seen.port == kGamePort);
++  // It is the peer the title will later learn from the joiner's XNADDR.
++  CHECK(host.Lookup(seen.ip) == XNetPeer{kLanA, 1});
++  CHECK(host.Register({kLanA, 1}) == seen.ip);
++  // The same sender maps to the same address.
++  CHECK(host.FromWire({XNetAddressTable::kLoopback, kGamePort + 1}, kGamePort) == seen);
++}
++
++TEST_CASE("Traffic that is not a peer passes through", "[xnet]") {
++  XNetAddressTable table;
++  table.SetLocalIp(kLanA);
++  table.SetLocalPortOffset(0);
++  table.Register({kLanA, 0});
++  // Our own address and offset: not registered as a new peer, left as is.
++  CHECK(table.FromWire({XNetAddressTable::kLoopback, kGamePort}, kGamePort) ==
++        XNetEndpoint{XNetAddressTable::kLoopback, kGamePort});
++  // A port below the game port (DNS and the like), and one far above it.
++  CHECK(table.FromWire({kLanB, 53}, kGamePort) == XNetEndpoint{kLanB, 53});
++  CHECK(table.FromWire({kLanB, kGamePort + 100}, kGamePort) == XNetEndpoint{kLanB, kGamePort + 100});
++  // A socket with no game port (ephemeral) never creates peers.
++  CHECK(table.FromWire({kLanB, kGamePort}, 0) == XNetEndpoint{kLanB, kGamePort});
++}
++
++TEST_CASE("A remote joiner is registered on first contact", "[xnet]") {
++  XNetAddressTable host;
++  host.SetLocalIp(kLanA);
++  host.SetLocalPortOffset(0);
++  host.Register({kLanA, 0});
++
++  XNetEndpoint seen = host.FromWire({kLanB, kGamePort}, kGamePort);
++  CHECK(XNetAddressTable::IsVirtual(seen.ip));
++  CHECK(host.Lookup(seen.ip) == XNetPeer{kLanB, 0});
++  // Replies to the virtual address go back to the joiner's real endpoint.
++  CHECK(host.ToWire({seen.ip, kGamePort}) == XNetEndpoint{kLanB, kGamePort});
 +}
 diff --git a/tests/unit/system/xsession_discovery_test.cpp b/tests/unit/system/xsession_discovery_test.cpp
 new file mode 100644
