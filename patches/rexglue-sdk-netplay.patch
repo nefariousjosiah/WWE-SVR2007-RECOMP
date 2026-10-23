@@ -174,10 +174,10 @@ index ec37017..72cdcfd 100644
  }  // namespace rex
 diff --git a/include/rex/system/xnet_address_table.h b/include/rex/system/xnet_address_table.h
 new file mode 100644
-index 0000000..c850eb8
+index 0000000..2c9bf2d
 --- /dev/null
 +++ b/include/rex/system/xnet_address_table.h
-@@ -0,0 +1,119 @@
+@@ -0,0 +1,124 @@
 +/**
 + * @file        system/xnet_address_table.h
 + * @brief       Maps XNet peers to opaque guest IN_ADDRs and real UDP endpoints
@@ -245,6 +245,11 @@ index 0000000..c850eb8
 +    // Old or zeroed XNADDRs carry no port; treat them as unshifted.
 +    return port ? int32_t(port) - kXNetBasePort : 0;
 +  }
++
++  // The XNADDR hardware fields of the instance at `peer` (abEnet, a locally administered unicast
++  // MAC, and abOnline), derived from its endpoint alone so any instance can rebuild a peer's
++  // XNADDR from the address its packets come from. Distinct for every instance on a PC.
++  static void PeerIds(const XNetPeer& peer, uint8_t (&enet)[6], uint8_t (&online)[20]);
 +
 +  void SetLocalPortOffset(int32_t offset);
 +  int32_t local_port_offset() const;
@@ -1043,7 +1048,7 @@ index 80c3634..0d01b5c 100644
    return result;
  }
 diff --git a/src/kernel/xam/xam_net.cpp b/src/kernel/xam/xam_net.cpp
-index 58e36a4..5f8dbba 100644
+index 58e36a4..0e7dc1c 100644
 --- a/src/kernel/xam/xam_net.cpp
 +++ b/src/kernel/xam/xam_net.cpp
 @@ -12,15 +12,25 @@
@@ -1308,7 +1313,7 @@ index 58e36a4..5f8dbba 100644
  
    // TODO: Instantly complete overlapped
  
-@@ -435,11 +612,17 @@ struct XnAddrStatus {
+@@ -435,28 +612,69 @@ struct XnAddrStatus {
    static const uint32_t XNET_GET_XNADDR_TROUBLESHOOT = 0x00008000;
  };
  
@@ -1319,37 +1324,67 @@ index 58e36a4..5f8dbba 100644
 -  addr_ptr->wPortOnline = 0;
 +static_assert(sizeof(XNADDR) == kXnAddrSize);
 +
++// The XNADDR of the instance at `peer`. Our XNADDR carries our real endpoint: peers unpack it
++// directly in XNetXnAddrToInAddr, no lookup service needed. inaOnline equals ina until a
++// matchmaking server can tell us our public address.
++//
++// Everything in it follows from the endpoint, so a host that only knows a joiner by the address
++// its packets come from (XNetInAddrToXnAddr) rebuilds the very XNADDR the joiner reports about
++// itself. Titles compare the two: DemonWare drops a peer whose "common addr" differs.
++void FillXnAddr(XNADDR* addr_ptr, const XNetPeer& peer) {
++  std::memset(addr_ptr, 0, sizeof(XNADDR));
++  StoreInAddr(addr_ptr->ina, peer.ip);
++  StoreInAddr(addr_ptr->inaOnline, peer.ip);
++  addr_ptr->wPortOnline = XNetAddressTable::AdvertisedPort(peer.port_offset);
++  // RakNet's 360 version uses abEnet to seed "random" 64-bit ids, and a zero one makes
++  // RakPeer::Startup fail (58411436 crashes on startup), so each instance needs its own.
++  XNetAddressTable::PeerIds(peer, addr_ptr->abEnet, addr_ptr->abOnline);
++}
++
++// What XNetInAddrToXnAddr hands back for a peer: the XNADDR and session key the title passed to
++// XNetXnAddrToInAddr for it, byte for byte. Peers that reached us first (a joiner, to its host)
++// get a rebuilt XNADDR and the key we registered last; with one session at a time that is the
++// session they joined.
++struct PeerIdentity {
++  XNADDR xnaddr;
++  XNKID kid;
++  bool has_kid = false;
++};
++std::mutex g_identity_mutex;
++std::map<uint32_t, PeerIdentity> g_identities;  // by virtual address
++XNKID g_last_key{};
++bool g_has_key = false;
++
++// First bytes of a packet as hex, for trace logs.
++std::string HexPreview(const void* data, size_t size, size_t max = 32) {
++  auto* bytes = static_cast<const uint8_t*>(data);
++  std::string out;
++  for (size_t i = 0; i < size && i < max; ++i) {
++    out += fmt::format("{:02X}", bytes[i]);
++  }
++  if (size > max) {
++    out += "..";
++  }
++  return out;
++}
+ 
+-  // TODO(gibbed): A proper mac address.
+-  // RakNet's 360 version appears to depend on abEnet to create "random" 64-bit
+-  // numbers. A zero value will cause RakPeer::Startup to fail. This causes
+-  // 58411436 to crash on startup.
+-  // The 360-specific code is scrubbed from the RakNet repo, but there's still
+-  // traces of what it's doing which match the game code.
+-  // https://github.com/facebookarchive/RakNet/blob/master/Source/RakPeer.cpp#L382
+-  // https://github.com/facebookarchive/RakNet/blob/master/Source/RakPeer.cpp#L4527
+-  // https://github.com/facebookarchive/RakNet/blob/master/Source/RakPeer.cpp#L4467
+-  // "Mac address is a poor solution because you can't have multiple connections
+-  // from the same system"
+-  std::memset(addr_ptr->abEnet, 0xCC, 6);
 +uint32_t FillTitleXnAddr(uint8_t* out) {
 +  auto* addr_ptr = reinterpret_cast<XNADDR*>(out);
-+  // Our XNADDR carries our real endpoint: peers unpack it directly in
-+  // XNetXnAddrToInAddr, no lookup service needed. inaOnline equals ina until
-+  // a matchmaking server can tell us our public address.
-+  uint32_t ip = LocalIPv4();
-+  StoreInAddr(addr_ptr->ina, ip);
-+  StoreInAddr(addr_ptr->inaOnline, ip);
-+  addr_ptr->wPortOnline = XNetAddressTable::AdvertisedPort(xnet_table().local_port_offset());
++  FillXnAddr(addr_ptr, XNetPeer{LocalIPv4(), xnet_table().local_port_offset()});
  
-   // TODO(gibbed): A proper mac address.
-   // RakNet's 360 version appears to depend on abEnet to create "random" 64-bit
-@@ -452,11 +635,33 @@ u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
-   // https://github.com/facebookarchive/RakNet/blob/master/Source/RakPeer.cpp#L4467
-   // "Mac address is a poor solution because you can't have multiple connections
-   // from the same system"
--  std::memset(addr_ptr->abEnet, 0xCC, 6);
-+  // Derive it from the XUID so every install (and every local instance with
-+  // its own config) gets a distinct one.
-+  uint64_t xuid = REX_KERNEL_STATE()->user_profile()->xuid();
-+  for (int i = 0; i < 6; ++i) {
-+    addr_ptr->abEnet[i] = static_cast<uint8_t>(xuid >> (8 * i));
-+  }
-+  // Locally administered, unicast.
-+  addr_ptr->abEnet[0] = (addr_ptr->abEnet[0] & 0xFC) | 0x02;
- 
-   std::memset(addr_ptr->abOnline, 0, 20);
-+  for (int i = 0; i < 8; ++i) {
-+    addr_ptr->abOnline[i] = static_cast<uint8_t>(xuid >> (56 - 8 * i));
-+  }
-+
+-  std::memset(addr_ptr->abOnline, 0, 20);
 +  uint32_t status = XnAddrStatus::XNET_GET_XNADDR_STATIC | XnAddrStatus::XNET_GET_XNADDR_GATEWAY |
 +                    XnAddrStatus::XNET_GET_XNADDR_DNS;
 +  if (IsSignedInOnline()) {
@@ -1367,7 +1402,7 @@ index 58e36a4..5f8dbba 100644
  }
  
  u32 NetDll_XNetGetDebugXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
-@@ -471,23 +676,117 @@ u32 NetDll_XNetXnAddrToMachineId_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr, m
+@@ -471,23 +689,154 @@ u32 NetDll_XNetXnAddrToMachineId_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr, m
    return 1;
  }
  
@@ -1414,8 +1449,19 @@ index 58e36a4..5f8dbba 100644
 +    REXKRNL_ERROR("[net] XNetXnAddrToInAddr: peer table full");
 +    return kWSAEINVAL;
 +  }
-+  REXKRNL_DEBUG("[net] XNetXnAddrToInAddr({} offset {}) -> {}", FormatIPv4(peer.ip),
-+                peer.port_offset, FormatIPv4(virtual_ip));
++  {
++    std::lock_guard lock(g_identity_mutex);
++    auto& identity = g_identities[virtual_ip];
++    std::memcpy(&identity.xnaddr, xn_addr.host_address(), sizeof(XNADDR));
++    identity.has_kid = bool(xid);
++    if (xid) {
++      std::memcpy(identity.kid.ab, xid->ab, sizeof(identity.kid.ab));
++    }
++  }
++  REXKRNL_DEBUG("[net] XNetXnAddrToInAddr({} offset {}, kid {}) -> {}; XNADDR {}",
++                FormatIPv4(peer.ip), peer.port_offset,
++                xid ? HexPreview(xid->ab, sizeof(xid->ab)) : "none", FormatIPv4(virtual_ip),
++                HexPreview(xn_addr.host_address(), sizeof(XNADDR), sizeof(XNADDR)));
 +  StoreInAddr(*in_addr_out, virtual_ip);
 +  return 0;
  }
@@ -1432,23 +1478,40 @@ index 58e36a4..5f8dbba 100644
 +    REXKRNL_WARN("[net] XNetInAddrToXnAddr({}): unknown address", FormatIPv4(in_addr));
 +    return kWSAEINVAL;
 +  }
-+  REXKRNL_DEBUG("[net] XNetInAddrToXnAddr({}) -> {} offset {}", FormatIPv4(in_addr),
-+                FormatIPv4(peer->ip), peer->port_offset);
++  XNADDR addr;
++  XNKID kid{};
++  const char* source;
++  {
++    std::lock_guard lock(g_identity_mutex);
++    auto it = g_identities.find(in_addr);
++    if (it != g_identities.end()) {
++      addr = it->second.xnaddr;
++      kid = it->second.has_kid ? it->second.kid : g_last_key;
++      source = "as given";
++    } else {
++      FillXnAddr(&addr, *peer);
++      kid = g_last_key;
++      source = "rebuilt";
++    }
++  }
++  REXKRNL_DEBUG("[net] XNetInAddrToXnAddr({}) -> {} offset {}, kid {:02X}; XNADDR {} ({})",
++                FormatIPv4(in_addr), FormatIPv4(peer->ip), peer->port_offset,
++                fmt::join(kid.ab, ""), HexPreview(&addr, sizeof(addr), sizeof(addr)), source);
 +  if (xn_addr) {
-+    xn_addr.Zero();
-+    StoreInAddr(xn_addr->ina, peer->ip);
-+    StoreInAddr(xn_addr->inaOnline, peer->ip);
-+    xn_addr->wPortOnline = XNetAddressTable::AdvertisedPort(peer->port_offset);
++    std::memcpy(xn_addr.host_address(), &addr, sizeof(addr));
 +  }
 +  if (xid) {
-+    // Session keys aren't tracked per peer yet.
-+    xid.Zero();
++    std::memcpy(xid->ab, kid.ab, sizeof(kid.ab));
 +  }
 +  return 0;
 +}
 +
 +u32 NetDll_XNetUnregisterInAddr_entry(u32 caller, u32 in_addr) {
 +  bool ok = xnet_table().Unregister(in_addr);
++  {
++    std::lock_guard lock(g_identity_mutex);
++    g_identities.erase(in_addr);
++  }
 +  REXKRNL_DEBUG("[net] XNetUnregisterInAddr({}) -> {}", FormatIPv4(in_addr), ok ? "ok" : "unknown");
 +  return ok ? 0 : kWSAEINVAL;
 +}
@@ -1483,20 +1546,29 @@ index 58e36a4..5f8dbba 100644
 +
 +u32 NetDll_XNetRegisterKey_entry(u32 caller, ppc_ptr_t<XNKID> xid, ppc_ptr_t<XNKEY> key) {
 +  if (xid) {
-+    REXKRNL_DEBUG("[net] XNetRegisterKey(kid {:02X}) -> ok (keys unused)", fmt::join(xid->ab, ""));
++    // Not used for encryption; XNetInAddrToXnAddr reports it as the key of peers that reached us.
++    std::lock_guard lock(g_identity_mutex);
++    std::memcpy(g_last_key.ab, xid->ab, sizeof(g_last_key.ab));
++    g_has_key = true;
++    REXKRNL_DEBUG("[net] XNetRegisterKey(kid {:02X}) -> ok", fmt::join(xid->ab, ""));
 +  }
 +  return 0;
 +}
 +
 +u32 NetDll_XNetUnregisterKey_entry(u32 caller, ppc_ptr_t<XNKID> xid) {
 +  if (xid) {
++    std::lock_guard lock(g_identity_mutex);
++    if (g_has_key && std::memcmp(g_last_key.ab, xid->ab, sizeof(xid->ab)) == 0) {
++      g_last_key = XNKID{};
++      g_has_key = false;
++    }
 +    REXKRNL_DEBUG("[net] XNetUnregisterKey(kid {:02X})", fmt::join(xid->ab, ""));
 +  }
 +  return 0;
  }
  
  // https://www.google.com/patents/WO2008112448A1?cl=en
-@@ -506,10 +805,14 @@ struct XEthernetStatus {
+@@ -506,10 +855,14 @@ struct XEthernetStatus {
  };
  
  u32 NetDll_XNetGetEthernetLinkStatus_entry(u32 caller) {
@@ -1512,7 +1584,7 @@ index 58e36a4..5f8dbba 100644
    // TODO(gibbed): actually implement this
    if (pdns) {
      auto dns_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(sizeof(XNDNS));
-@@ -534,6 +837,7 @@ u32 NetDll_XNetDnsRelease_entry(u32 caller, ppc_ptr_t<XNDNS> dns) {
+@@ -534,6 +887,7 @@ u32 NetDll_XNetDnsRelease_entry(u32 caller, ppc_ptr_t<XNDNS> dns) {
  }
  
  u32 NetDll_XNetQosServiceLookup_entry(u32 caller, u32 flags, u32 event_handle, mapped_u32 pqos) {
@@ -1520,7 +1592,7 @@ index 58e36a4..5f8dbba 100644
    // Set pqos as some games will try accessing it despite non-successful result
    if (pqos) {
      auto qos_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(sizeof(XNQOS));
-@@ -557,9 +861,164 @@ u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) {
+@@ -557,9 +911,164 @@ u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) {
    return 0;
  }
  
@@ -1688,7 +1760,7 @@ index 58e36a4..5f8dbba 100644
  }
  
  u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
-@@ -588,15 +1047,19 @@ u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
+@@ -588,15 +1097,19 @@ u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
      socket->Release();
  
      uint32_t error = xboxkrnl::xeRtlNtStatusToDosError(result);
@@ -1710,7 +1782,7 @@ index 58e36a4..5f8dbba 100644
    if (!socket) {
      // WSAENOTSOCK
      XThread::SetLastError(0x2736);
-@@ -611,7 +1074,7 @@ u32 NetDll_closesocket_entry(u32 caller, u32 socket_handle) {
+@@ -611,7 +1124,7 @@ u32 NetDll_closesocket_entry(u32 caller, u32 socket_handle) {
  }
  
  i32 NetDll_shutdown_entry(u32 caller, u32 socket_handle, i32 how) {
@@ -1719,7 +1791,7 @@ index 58e36a4..5f8dbba 100644
    if (!socket) {
      // WSAENOTSOCK
      XThread::SetLastError(0x2736);
-@@ -632,7 +1095,7 @@ i32 NetDll_shutdown_entry(u32 caller, u32 socket_handle, i32 how) {
+@@ -632,7 +1145,7 @@ i32 NetDll_shutdown_entry(u32 caller, u32 socket_handle, i32 how) {
  
  u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optname,
                              mapped_void optval_ptr, u32 optlen) {
@@ -1728,7 +1800,7 @@ index 58e36a4..5f8dbba 100644
    if (!socket) {
      // WSAENOTSOCK
      XThread::SetLastError(0x2736);
-@@ -640,11 +1103,21 @@ u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optnam
+@@ -640,11 +1153,21 @@ u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optnam
    }
  
    X_STATUS status = socket->SetOption(level, optname, optval_ptr, optlen);
@@ -1751,7 +1823,7 @@ index 58e36a4..5f8dbba 100644
    if (!socket) {
      // WSAENOTSOCK
      XThread::SetLastError(0x2736);
-@@ -652,6 +1125,9 @@ u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void
+@@ -652,6 +1175,9 @@ u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void
    }
  
    X_STATUS status = socket->IOControl(cmd, arg_ptr);
@@ -1761,7 +1833,7 @@ index 58e36a4..5f8dbba 100644
    if (XFAILED(status)) {
      XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
      return -1;
-@@ -662,7 +1138,7 @@ u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void
+@@ -662,7 +1188,7 @@ u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void
  }
  
  u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> name, u32 namelen) {
@@ -1770,7 +1842,7 @@ index 58e36a4..5f8dbba 100644
    if (!socket) {
      // WSAENOTSOCK
      XThread::SetLastError(0x2736);
-@@ -670,17 +1146,25 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
+@@ -670,17 +1196,25 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
    }
  
    N_XSOCKADDR_IN native_name(name);
@@ -1797,7 +1869,7 @@ index 58e36a4..5f8dbba 100644
    if (!socket) {
      // WSAENOTSOCK
      XThread::SetLastError(0x2736);
-@@ -688,6 +1172,17 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
+@@ -688,6 +1222,17 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
    }
  
    N_XSOCKADDR native_name(name);
@@ -1815,7 +1887,7 @@ index 58e36a4..5f8dbba 100644
    X_STATUS status = socket->Connect(&native_name, namelen);
    if (XFAILED(status)) {
      XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
-@@ -698,7 +1193,7 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
+@@ -698,7 +1243,7 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
  }
  
  u32 NetDll_listen_entry(u32 caller, u32 socket_handle, i32 backlog) {
@@ -1824,7 +1896,7 @@ index 58e36a4..5f8dbba 100644
    if (!socket) {
      // WSAENOTSOCK
      XThread::SetLastError(0x2736);
-@@ -722,7 +1217,7 @@ u32 NetDll_accept_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> addr
+@@ -722,7 +1267,7 @@ u32 NetDll_accept_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> addr
      return -1;
    }
  
@@ -1833,7 +1905,7 @@ index 58e36a4..5f8dbba 100644
    if (!socket) {
      // WSAENOTSOCK
      XThread::SetLastError(0x2736);
-@@ -737,7 +1232,7 @@ u32 NetDll_accept_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> addr
+@@ -737,7 +1282,7 @@ u32 NetDll_accept_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> addr
      std::memcpy(addr_ptr->sa_data, native_addr.sa_data, *addrlen_ptr - 2);
      *addrlen_ptr = native_len;
  
@@ -1842,7 +1914,7 @@ index 58e36a4..5f8dbba 100644
    } else {
      return -1;
    }
-@@ -762,7 +1257,7 @@ struct host_set {
+@@ -762,7 +1307,7 @@ struct host_set {
          break;
        }
        // Convert from Xenia -> native
@@ -1851,7 +1923,7 @@ index 58e36a4..5f8dbba 100644
        assert_not_null(socket);
        this->sockets[i] = socket;
      }
-@@ -772,7 +1267,7 @@ struct host_set {
+@@ -772,7 +1317,7 @@ struct host_set {
      guest_set->fd_count = 0;
      for (uint32_t i = 0; i < this->count; ++i) {
        auto socket = this->sockets[i];
@@ -1860,7 +1932,7 @@ index 58e36a4..5f8dbba 100644
      }
    }
  
-@@ -825,6 +1320,7 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
+@@ -825,6 +1370,7 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
                                               reinterpret_cast<int32_t*>(&timeout.tv_usec));
      timeout_in = &timeout;
    }
@@ -1868,7 +1940,7 @@ index 58e36a4..5f8dbba 100644
    int ret = select(nfds, readfds ? &native_readfds : nullptr, writefds ? &native_writefds : nullptr,
                     exceptfds ? &native_exceptfds : nullptr, timeout_in);
    if (readfds) {
-@@ -840,12 +1336,24 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
+@@ -840,12 +1386,24 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
      host_exceptfds.Store(exceptfds);
    }
  
@@ -1894,7 +1966,7 @@ index 58e36a4..5f8dbba 100644
    if (!socket) {
      // WSAENOTSOCK
      XThread::SetLastError(0x2736);
-@@ -857,7 +1365,7 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+@@ -857,7 +1415,7 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
  
  u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len,
                            u32 flags, ppc_ptr_t<XSOCKADDR_IN> from_ptr, mapped_u32 fromlen_ptr) {
@@ -1903,7 +1975,7 @@ index 58e36a4..5f8dbba 100644
    if (!socket) {
      // WSAENOTSOCK
      XThread::SetLastError(0x2736);
-@@ -871,6 +1379,24 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
+@@ -871,6 +1429,25 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
    uint32_t native_fromlen = fromlen_ptr ? fromlen_ptr.value() : 0;
    int ret =
        socket->RecvFrom(buf_ptr, buf_len, flags, &native_from, fromlen_ptr ? &native_fromlen : 0);
@@ -1921,14 +1993,15 @@ index 58e36a4..5f8dbba 100644
 +    uint32_t wire_ip = native_from.sin_addr;
 +    uint16_t wire_port = native_from.sin_port;
 +    TranslateFromWire(native_from, *socket);
-+    REXKRNL_TRACE("[net] recvfrom(sock {}) {} bytes from {}:{} (guest sees {}:{})",
++    REXKRNL_TRACE("[net] recvfrom(sock {}) {} bytes from {}:{} (guest sees {}:{}): {}",
 +                  uint32_t(socket_handle), ret, FormatIPv4(wire_ip), wire_port,
-+                  FormatIPv4(native_from.sin_addr), uint16_t(native_from.sin_port));
++                  FormatIPv4(native_from.sin_addr), uint16_t(native_from.sin_port),
++                  HexPreview(buf_ptr.host_address(), size_t(ret)));
 +  }
  
    if (from_ptr) {
      from_ptr->sin_family = native_from.sin_family;
-@@ -887,6 +1413,11 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
+@@ -887,6 +1464,11 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
  #if REX_PLATFORM_WIN32
      uint32_t error_code = WSAGetLastError();
      XThread::SetLastError(error_code);
@@ -1940,7 +2013,7 @@ index 58e36a4..5f8dbba 100644
  #else
      XThread::SetLastError(0x0);
  #endif
-@@ -896,7 +1427,7 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
+@@ -896,7 +1478,7 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
  }
  
  u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags) {
@@ -1949,7 +2022,7 @@ index 58e36a4..5f8dbba 100644
    if (!socket) {
      // WSAENOTSOCK
      XThread::SetLastError(0x2736);
-@@ -908,15 +1439,29 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+@@ -908,15 +1490,30 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
  
  u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags,
                          ppc_ptr_t<XSOCKADDR_IN> to_ptr, u32 to_len) {
@@ -1970,10 +2043,11 @@ index 58e36a4..5f8dbba 100644
 +  }
 +  int ret = socket->SendTo(buf_ptr, buf_len, flags, to_ptr ? &native_to : nullptr, to_len);
 +  if (to_ptr) {
-+    REXKRNL_TRACE("[net] sendto(sock {}, {}:{} -> {}:{}) {} bytes -> {}", uint32_t(socket_handle),
-+                  FormatIPv4(to_ptr->sin_addr), uint16_t(to_ptr->sin_port),
-+                  FormatIPv4(native_to.sin_addr), uint16_t(native_to.sin_port), uint32_t(buf_len),
-+                  ret);
++    REXKRNL_TRACE("[net] sendto(sock {}, {}:{} -> {}:{}) {} bytes -> {}: {}",
++                  uint32_t(socket_handle), FormatIPv4(to_ptr->sin_addr),
++                  uint16_t(to_ptr->sin_port), FormatIPv4(native_to.sin_addr),
++                  uint16_t(native_to.sin_port), uint32_t(buf_len), ret,
++                  HexPreview(buf_ptr.host_address(), buf_len));
 +  }
 +  if (ret < 0) {
 +    REXKRNL_WARN("[net] sendto(sock {}) failed", uint32_t(socket_handle));
@@ -1982,7 +2056,7 @@ index 58e36a4..5f8dbba 100644
  }
  
  u32 NetDll___WSAFDIsSet_entry(u32 socket_handle, ppc_ptr_t<x_fd_set> fd_set) {
-@@ -959,6 +1504,12 @@ REX_EXPORT(__imp__NetDll_XNetXnAddrToMachineId,
+@@ -959,6 +1556,12 @@ REX_EXPORT(__imp__NetDll_XNetXnAddrToMachineId,
  REX_EXPORT(__imp__NetDll_XNetInAddrToString, rex::kernel::xam::NetDll_XNetInAddrToString_entry)
  REX_EXPORT(__imp__NetDll_XNetXnAddrToInAddr, rex::kernel::xam::NetDll_XNetXnAddrToInAddr_entry)
  REX_EXPORT(__imp__NetDll_XNetInAddrToXnAddr, rex::kernel::xam::NetDll_XNetInAddrToXnAddr_entry)
@@ -1995,7 +2069,7 @@ index 58e36a4..5f8dbba 100644
  REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
             rex::kernel::xam::NetDll_XNetSetSystemLinkPort_entry)
  REX_EXPORT(__imp__NetDll_XNetGetEthernetLinkStatus,
-@@ -968,6 +1519,7 @@ REX_EXPORT(__imp__NetDll_XNetDnsRelease, rex::kernel::xam::NetDll_XNetDnsRelease
+@@ -968,6 +1571,7 @@ REX_EXPORT(__imp__NetDll_XNetDnsRelease, rex::kernel::xam::NetDll_XNetDnsRelease
  REX_EXPORT(__imp__NetDll_XNetQosServiceLookup, rex::kernel::xam::NetDll_XNetQosServiceLookup_entry)
  REX_EXPORT(__imp__NetDll_XNetQosRelease, rex::kernel::xam::NetDll_XNetQosRelease_entry)
  REX_EXPORT(__imp__NetDll_XNetQosListen, rex::kernel::xam::NetDll_XNetQosListen_entry)
@@ -2003,7 +2077,7 @@ index 58e36a4..5f8dbba 100644
  REX_EXPORT(__imp__NetDll_inet_addr, rex::kernel::xam::NetDll_inet_addr_entry)
  REX_EXPORT(__imp__NetDll_socket, rex::kernel::xam::NetDll_socket_entry)
  REX_EXPORT(__imp__NetDll_closesocket, rex::kernel::xam::NetDll_closesocket_entry)
-@@ -1030,25 +1582,18 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
+@@ -1030,25 +1634,18 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
  REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
  REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
  REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
@@ -2030,7 +2104,7 @@ index 58e36a4..5f8dbba 100644
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetReceivedDataSize);
 diff --git a/src/kernel/xam/xam_user.cpp b/src/kernel/xam/xam_user.cpp
-index 8778066..aa2621b 100644
+index 8778066..4f28901 100644
 --- a/src/kernel/xam/xam_user.cpp
 +++ b/src/kernel/xam/xam_user.cpp
 @@ -12,7 +12,11 @@
@@ -2147,7 +2221,31 @@ index 8778066..aa2621b 100644
      return X_E_NO_SUCH_USER;
    }
  
-@@ -211,7 +249,7 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
+@@ -152,14 +190,17 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
+   if (!xuid_count) {
+     assert_null(xuids);
+   } else {
+-    assert_true(xuid_count == 1);
+     assert_not_null(xuids);
+-    // TODO(gibbed): allow proper lookup of arbitrary XUIDs
++    // Other players' profiles (an online opponent's, say) aren't available here: every XUID gets
++    // this console's settings, labelled with its own XUID so the title can match them up.
+     const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+-    assert_true(static_cast<uint64_t>(xuids[0]) == user_profile->xuid());
+-    // TODO(gibbed): we assert here, but in case a title passes xuid_count > 1
+-    // until it's implemented for release builds...
+-    xuid_count = 1;
++    for (uint32_t i = 0; i < xuid_count; ++i) {
++      if (static_cast<uint64_t>(xuids[i]) != user_profile->xuid()) {
++        REXKRNL_DEBUG("[net] XamUserReadProfileSettings: XUID {:016X} is not ours; answering "
++                      "with our settings ({} requested)",
++                      static_cast<uint64_t>(xuids[i]), setting_count);
++      }
++    }
+   }
+   assert_zero(unk);  // probably flags
+ 
+@@ -211,7 +252,7 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
    // Title ID = 0 means us.
    // 0xfffe07d1 = profile?
  
@@ -2156,7 +2254,56 @@ index 8778066..aa2621b 100644
      // Only support user 0.
      if (overlapped) {
        REX_KERNEL_STATE()->CompleteOverlappedImmediate(
-@@ -308,7 +346,7 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
+@@ -252,28 +293,32 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
+ 
+   auto out_header = reinterpret_cast<X_USER_READ_PROFILE_SETTINGS*>(buffer);
+   auto out_setting = reinterpret_cast<X_USER_PROFILE_SETTING*>(&out_header[1]);
+-  out_header->setting_count = static_cast<uint32_t>(setting_count);
++  // One block of settings per XUID asked about, in order.
++  const uint32_t blocks = xuids ? xuid_count : 1;
++  out_header->setting_count = static_cast<uint32_t>(setting_count * blocks);
+   out_header->settings_ptr = REX_KERNEL_MEMORY()->HostToGuestVirtual(out_setting);
+ 
+   UserProfile::SettingByteStream out_stream(REX_KERNEL_MEMORY()->HostToGuestVirtual(buffer), buffer,
+                                             buffer_size, needed_header_size);
+-  for (uint32_t n = 0; n < setting_count; ++n) {
+-    uint32_t setting_id = setting_ids[n];
+-    auto setting = user_profile->GetSetting(setting_id);
+-
+-    std::memset(out_setting, 0, sizeof(X_USER_PROFILE_SETTING));
+-    out_setting->from = !setting || !setting->is_set ? 0 : setting->is_title_specific() ? 2 : 1;
+-    if (xuids) {
+-      out_setting->xuid = user_profile->xuid();
+-    } else {
+-      out_setting->user_index = static_cast<uint32_t>(user_index);
+-    }
+-    out_setting->setting_id = setting_id;
++  for (uint32_t block = 0; block < blocks; ++block) {
++    for (uint32_t n = 0; n < setting_count; ++n) {
++      uint32_t setting_id = setting_ids[n];
++      auto setting = user_profile->GetSetting(setting_id);
++
++      std::memset(out_setting, 0, sizeof(X_USER_PROFILE_SETTING));
++      out_setting->from = !setting || !setting->is_set ? 0 : setting->is_title_specific() ? 2 : 1;
++      if (xuids) {
++        out_setting->xuid = static_cast<uint64_t>(xuids[block]);
++      } else {
++        out_setting->user_index = static_cast<uint32_t>(user_index);
++      }
++      out_setting->setting_id = setting_id;
+ 
+-    if (setting && setting->is_set) {
+-      setting->Append(&out_setting->data, &out_stream);
++      if (setting && setting->is_set) {
++        setting->Append(&out_setting->data, &out_stream);
++      }
++      ++out_setting;
+     }
+-    ++out_setting;
+   }
+ 
+   if (overlapped) {
+@@ -308,7 +353,7 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
      return X_ERROR_INVALID_PARAMETER;
    }
  
@@ -2165,7 +2312,7 @@ index 8778066..aa2621b 100644
      // Only support user 0.
      if (overlapped) {
        REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped.guest_address(),
-@@ -377,18 +415,23 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value)
+@@ -377,18 +422,23 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value)
        return X_ERROR_INVALID_PARAMETER;
      }
  
@@ -2193,7 +2340,7 @@ index 8778066..aa2621b 100644
      return X_ERROR_NO_SUCH_USER;
    }
  
-@@ -399,7 +442,7 @@ u32 XamUserContentRestrictionGetFlags_entry(u32 user_index, mapped_u32 out_flags
+@@ -399,7 +449,7 @@ u32 XamUserContentRestrictionGetFlags_entry(u32 user_index, mapped_u32 out_flags
  
  u32 XamUserContentRestrictionGetRating_entry(u32 user_index, u32 unk1, mapped_u32 out_unk2,
                                               mapped_u32 out_unk3) {
@@ -2202,7 +2349,7 @@ index 8778066..aa2621b 100644
      return X_ERROR_NO_SUCH_USER;
    }
  
-@@ -430,7 +473,7 @@ u32 XamUserGetMembershipTier_entry(u32 user_index) {
+@@ -430,7 +480,7 @@ u32 XamUserGetMembershipTier_entry(u32 user_index) {
    if (user_index >= 4) {
      return X_ERROR_INVALID_PARAMETER;
    }
@@ -2211,7 +2358,7 @@ index 8778066..aa2621b 100644
      return X_ERROR_NO_SUCH_USER;
    }
    return 6 /* 6 appears to be Gold */;
-@@ -476,6 +519,8 @@ u32 XamUserAreUsersFriends_entry(u32 user_index, u32 unk1, u32 unk2, mapped_u32
+@@ -476,6 +526,8 @@ u32 XamUserAreUsersFriends_entry(u32 user_index, u32 unk1, u32 unk2, mapped_u32
  }
  
  u32 XamShowSigninUI_entry(u32 unk, u32 unk_mask) {
@@ -2220,7 +2367,7 @@ index 8778066..aa2621b 100644
    // Mask values vary. Probably matching user types? Local/remote?
  
    // To fix game modes that display a 4 profile signin UI (even if playing
-@@ -679,6 +724,91 @@ u32 XamUserCreateAchievementEnumerator_entry(u32 title_id, u32 user_index, u32 x
+@@ -679,6 +731,91 @@ u32 XamUserCreateAchievementEnumerator_entry(u32 title_id, u32 user_index, u32 x
    return X_ERROR_SUCCESS;
  }
  
@@ -2312,7 +2459,7 @@ index 8778066..aa2621b 100644
  u32 XamParseGamerTileKey_entry(mapped_u32 key_ptr, mapped_u32 out1_ptr, mapped_u32 out2_ptr,
                                 mapped_u32 out3_ptr) {
    *out1_ptr = 0xC0DE0001;
-@@ -751,6 +881,8 @@ REX_EXPORT(__imp__XamUserAreUsersFriends, rex::kernel::xam::XamUserAreUsersFrien
+@@ -751,6 +888,8 @@ REX_EXPORT(__imp__XamUserAreUsersFriends, rex::kernel::xam::XamUserAreUsersFrien
  REX_EXPORT(__imp__XamShowSigninUI, rex::kernel::xam::XamShowSigninUI_entry)
  REX_EXPORT(__imp__XamUserCreateAchievementEnumerator,
             rex::kernel::xam::XamUserCreateAchievementEnumerator_entry)
@@ -2321,7 +2468,7 @@ index 8778066..aa2621b 100644
  REX_EXPORT(__imp__XamParseGamerTileKey, rex::kernel::xam::XamParseGamerTileKey_entry)
  REX_EXPORT(__imp__XamReadTileToTexture, rex::kernel::xam::XamReadTileToTexture_entry)
  REX_EXPORT(__imp__XamWriteGamerTile, rex::kernel::xam::XamWriteGamerTile_entry)
-@@ -761,7 +893,6 @@ REX_EXPORT_STUB(__imp__XamUserAddRecentPlayer);
+@@ -761,7 +900,6 @@ REX_EXPORT_STUB(__imp__XamUserAddRecentPlayer);
  REX_EXPORT_STUB(__imp__XamUserAllowedToPostToSocialNetwork);
  REX_EXPORT_STUB(__imp__XamUserCreateAvatarAssetEnumerator);
  REX_EXPORT_STUB(__imp__XamUserCreatePlayerEnumerator);
@@ -2554,10 +2701,10 @@ index a77f5e6..d774a31 100644
    std::swap(settings_[setting->setting_id], previous_setting);
 diff --git a/src/system/xnet_address_table.cpp b/src/system/xnet_address_table.cpp
 new file mode 100644
-index 0000000..e2d65f2
+index 0000000..87e3603
 --- /dev/null
 +++ b/src/system/xnet_address_table.cpp
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,192 @@
 +/**
 + * @file        system/xnet_address_table.cpp
 + * @brief       XNet peer address mapping
@@ -2566,6 +2713,33 @@ index 0000000..e2d65f2
 +#include <rex/system/xnet_address_table.h>
 +
 +namespace rex::system {
++
++namespace {
++// splitmix64: spreads the endpoint over all the bytes, so two instances differ everywhere.
++uint64_t Mix(uint64_t x) {
++  x += 0x9E3779B97F4A7C15ull;
++  x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
++  x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
++  return x ^ (x >> 31);
++}
++}  // namespace
++
++void XNetAddressTable::PeerIds(const XNetPeer& peer, uint8_t (&enet)[6], uint8_t (&online)[20]) {
++  const uint64_t endpoint = uint64_t(peer.ip) << 16 | AdvertisedPort(peer.port_offset);
++  const uint64_t a = Mix(endpoint);
++  for (int i = 0; i < 6; ++i) {
++    enet[i] = static_cast<uint8_t>(a >> (8 * i));
++  }
++  // Locally administered, unicast.
++  enet[0] = (enet[0] & 0xFC) | 0x02;
++  uint64_t b = a;
++  for (int i = 0; i < 20; ++i) {
++    if (i % 8 == 0) {
++      b = Mix(b);
++    }
++    online[i] = static_cast<uint8_t>(b >> (8 * (i % 8)));
++  }
++}
 +
 +void XNetAddressTable::SetLocalPortOffset(int32_t offset) {
 +  std::lock_guard<std::mutex> lock(mutex_);
@@ -3212,10 +3386,30 @@ index 0000000..ee58650
 +
 +}  // namespace rex::system
 diff --git a/src/system/xsocket.cpp b/src/system/xsocket.cpp
-index 2d13ac8..fd90432 100644
+index 2d13ac8..697fbeb 100644
 --- a/src/system/xsocket.cpp
 +++ b/src/system/xsocket.cpp
-@@ -186,14 +186,14 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
+@@ -57,6 +57,19 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
+     return X_STATUS_UNSUCCESSFUL;
+   }
+ 
++#if REX_PLATFORM_WIN32
++  if (type == Type::X_SOCK_DGRAM) {
++    // Windows reports an ICMP "port unreachable" (a peer that quit) as WSAECONNRESET on the next
++    // recvfrom. A console never does, and DemonWare closes the connection when it sees one, so
++    // a peer leaving would drop every other peer too.
++    constexpr DWORD kSioUdpConnReset = _WSAIOW(IOC_VENDOR, 12);  // SIO_UDP_CONNRESET
++    BOOL report = FALSE;
++    DWORD returned = 0;
++    WSAIoctl(SOCKET(native_handle_), kSioUdpConnReset, &report, sizeof(report), nullptr, 0,
++             &returned, nullptr, nullptr);
++  }
++#endif
++
+   return X_STATUS_SUCCESS;
+ }
+ 
+@@ -186,14 +199,14 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
    }
    */
  
@@ -3232,7 +3426,7 @@ index 2d13ac8..fd90432 100644
      std::memset(from->x_sin_zero, 0, sizeof(from->x_sin_zero));
    }
  
-@@ -221,11 +221,12 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
+@@ -221,11 +234,12 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
    }
    */
  
@@ -3249,7 +3443,7 @@ index 2d13ac8..fd90432 100644
  
    return sendto(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,
 diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
-index 7199826..184b667 100644
+index 7199826..fbf055d 100644
 --- a/src/ui/rex_app.cpp
 +++ b/src/ui/rex_app.cpp
 @@ -15,6 +15,7 @@
@@ -3260,15 +3454,41 @@ index 7199826..184b667 100644
  #include <rex/ui/flags.h>
  #include <rex/kernel/crt/heap.h>
  #include <rex/filesystem.h>
-@@ -50,6 +51,7 @@ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
+@@ -50,6 +51,10 @@ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
                        "GPU emulation plugin to load at startup (e.g. 'xenos'); empty disables "
                        "GPU emulation")
      .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 +REXCVAR_DECLARE(std::string, net_gamertag);
++REXCVAR_DEFINE_STRING(log_levels, "", "Log",
++                      "Per-category log levels, e.g. 'gpu=info,apu=info' (adds to [log.levels])")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
  
  namespace rex {
  
-@@ -179,6 +181,12 @@ bool ReXApp::SetupEnvironment() {
+@@ -164,6 +169,22 @@ bool ReXApp::SetupEnvironment() {
+     log_level_str = "trace";
+ 
+   auto category_levels = rex::ParseCategoryLevelsFromConfig(config_path_);
++  // --log_levels=gpu=info,apu=info: per-category levels from the command line, over the config's
++  // [log.levels], so a trace run of one subsystem isn't drowned (and rotated away) by another.
++  {
++    std::string spec = REXCVAR_GET(log_levels);
++    size_t start = 0;
++    while (start < spec.size()) {
++      size_t end = spec.find(',', start);
++      std::string item = spec.substr(start, end == std::string::npos ? std::string::npos : end - start);
++      size_t eq = item.find('=');
++      if (eq != std::string::npos && eq > 0)
++        category_levels[item.substr(0, eq)] = item.substr(eq + 1);
++      if (end == std::string::npos)
++        break;
++      start = end + 1;
++    }
++  }
+   auto log_config = rex::BuildLogConfig(log_file_cvar.empty() ? nullptr : log_file_cvar.c_str(),
+                                         log_level_str, category_levels);
+   if (log_file_cvar.empty()) {
+@@ -179,6 +200,12 @@ bool ReXApp::SetupEnvironment() {
  
    OnPostInitLogging();
  
@@ -3380,16 +3600,18 @@ index 0000000..85cd7a5
 +}
 diff --git a/tests/unit/system/xnet_address_table_test.cpp b/tests/unit/system/xnet_address_table_test.cpp
 new file mode 100644
-index 0000000..74a2023
+index 0000000..8f8aa5b
 --- /dev/null
 +++ b/tests/unit/system/xnet_address_table_test.cpp
-@@ -0,0 +1,215 @@
+@@ -0,0 +1,234 @@
 +/**
 + * Unit tests for XNetAddressTable
 + *
 + * Tests virtual address allocation, port shifting for several instances on
 + * one host, and translation in both directions.
 + */
++
++#include <cstring>
 +
 +#include <catch2/catch_test_macros.hpp>
 +
@@ -3408,6 +3630,23 @@ index 0000000..74a2023
 +  CHECK(XNetAddressTable::OffsetFromAdvertisedPort(kXNetBasePort + 1) == 1);
 +  CHECK(XNetAddressTable::OffsetFromAdvertisedPort(XNetAddressTable::AdvertisedPort(-4)) == -4);
 +  CHECK(XNetAddressTable::OffsetFromAdvertisedPort(0) == 0);
++}
++
++TEST_CASE("Peer ids follow from the endpoint alone", "[xnet]") {
++  uint8_t enet1[6], online1[20], enet2[6], online2[20];
++  XNetAddressTable::PeerIds({kLanA, 1}, enet1, online1);
++  XNetAddressTable::PeerIds({kLanA, 1}, enet2, online2);
++  CHECK(std::memcmp(enet1, enet2, 6) == 0);
++  CHECK(std::memcmp(online1, online2, 20) == 0);
++  // A locally administered unicast MAC.
++  CHECK((enet1[0] & 0x03) == 0x02);
++
++  // Another instance on the same PC, or the same offset on another PC, differs.
++  XNetAddressTable::PeerIds({kLanA, 0}, enet2, online2);
++  CHECK(std::memcmp(enet1, enet2, 6) != 0);
++  CHECK(std::memcmp(online1, online2, 20) != 0);
++  XNetAddressTable::PeerIds({kLanB, 1}, enet2, online2);
++  CHECK(std::memcmp(enet1, enet2, 6) != 0);
 +}
 +
 +TEST_CASE("Register allocates stable virtual addresses", "[xnet]") {

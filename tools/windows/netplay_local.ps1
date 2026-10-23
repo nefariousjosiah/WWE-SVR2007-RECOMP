@@ -31,8 +31,14 @@ $Api = if ($Exe -match 'd3d12') { "d3d12" } else { "vulkan" }
 function Start-Instance($tag, [string[]]$extra) {
   $log = "$Root\logs\net_$tag.log"
   if (Test-Path $log) { Move-Item $log "$Root\logs\net_$tag.prev.log" -Force }
+  # The previous run's rotated pieces (net_a.1.log, ...) would read as part of this run.
+  Get-ChildItem "$Root\logs" -Filter "net_$tag.*.log" -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match "^net_$tag\.\d+\.log$" } | Remove-Item -Force
   $argv = @(
     "`"--game_data_root=$Root\assets`"", "`"--log_file=$log`"", "--log_level=$Level",
+    # At trace the renderer writes ~30 MB a minute, which rotated away the start of a run; keep it
+    # (and audio, files) at info so the net trace stays, in fewer, bigger pieces.
+    "--log_levels=gpu=info,apu=info,fs=info", "--log_max_file_size_mb=50", "--log_max_files=40",
     "--fullscreen=false", "--window_width=960", "--window_height=540",
     "--svr_graphics_api=$Api", "--svr_60fps=true"
   ) + $extra
@@ -69,13 +75,18 @@ $steps = [ordered]@{
   "peer registered"      = '\[net\] XNetXnAddrToInAddr'
   "game traffic sent"    = '\[net\] (sendto|WSASendTo)'
   "game traffic received" = '\[net\] (recvfrom|WSARecvFrom)'
+  "peer identified"      = '\[net\] XNetInAddrToXnAddr'
+  "DemonWare join done"  = '\[dw\].*(Join allowed|Connected to all peers)'
   "match started"        = '\[fps\] entering gameplay'
 }
 foreach ($tag in @("a", "b")) {
   $log = "$Root\logs\net_$tag.log"
   Write-Host "`n=== instance $tag ($log)" -ForegroundColor Cyan
   if (-not (Test-Path $log)) { Write-Host "  no log"; continue }
-  $text = Get-Content $log
+  # Rotated pieces first (net_a.3.log is the oldest), then the live file.
+  $pieces = @(Get-ChildItem "$Root\logs" -Filter "net_$tag.*.log" | Where-Object { $_.Name -match "^net_$tag\.(\d+)\.log$" } |
+    Sort-Object { [int]($_.Name -replace "^net_$tag\.(\d+)\.log$", '$1') } -Descending | ForEach-Object FullName) + $log
+  $text = Get-Content $pieces
   foreach ($step in $steps.GetEnumerator()) {
     $hit = $text | Select-String -Pattern $step.Value | Select-Object -First 1
     if ($hit) {
@@ -89,4 +100,7 @@ foreach ($tag in @("a", "b")) {
   $problems = $text | Select-String -Pattern '\[net\].*(error|fail|unexpected|short buffer|no answer)|Unimplemented XGI|\[(critical)\]' |
     Select-Object -First 8
   foreach ($line in $problems) { Write-Host ("  ! " + $line.Line.Substring(0, [Math]::Min(170, $line.Line.Length))) -ForegroundColor Yellow }
+  # The game's own network messages (DemonWare and Yuke's gss layer), last ones first in mind.
+  $game = $text | Select-String -Pattern '\] \[(dw|gss)\] ' | Select-Object -Last 12
+  if ($game) { Write-Host "  game network messages (last 12):" -ForegroundColor DarkCyan; foreach ($l in $game) { Write-Host ("    " + $l.Line.Substring(26, [Math]::Min(170, $l.Line.Length - 26))) } }
 }
