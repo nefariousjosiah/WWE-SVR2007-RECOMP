@@ -17,6 +17,7 @@ set(SVR2007_SOURCES
     src/fps_hooks.cpp
     src/game_locator.cpp
     src/input_script.cpp
+    src/online_probe.cpp
     src/keyboard_ui.cpp
     src/loading_hooks.cpp
     src/movie_async.cpp

@@ -2,7 +2,7 @@
 #   powershell -ExecutionPolicy Bypass -File tools\windows\netplay_local.ps1 [-Seconds 600] [-Exe <path>]
 #
 # A (host, say): your controller; net_port 3074; saves in userdata\;   log logs\net_a.log
-# B (joiner):    keyboard only (input_backend=none), so the controller doesn't drive both; it
+# B (joiner):    keyboard only (input_backend=none; -BInput controller changes that), so the controller doesn't drive both; it
 #                only gets keys while its window has focus (defaults: README, F4 to rebind);
 #                net_port 3075 (port offset 1); its own identity and userdata_b\; logs\net_b.log
 # Each instance answers session searches on UDP 3070 + its offset; a search asks this PC, the
@@ -11,6 +11,9 @@
 param(
   [int]$Seconds = 0,
   [string]$Exe = "",
+  # B's input: "keyboard" (default; B ignores the controller) or "controller" (B reads the same
+  # controller as A; only the window with focus gets it, like any SDL game).
+  [ValidateSet("keyboard", "controller")][string]$BInput = "keyboard",
   [string]$Level = "trace"  # trace: every packet (sendto/recvfrom) is logged
 )
 $ErrorActionPreference = "Stop"
@@ -43,9 +46,8 @@ $a = Start-Instance "a" @("`"--user_data_root=$Root\userdata`"", "--net_port=307
 Start-Sleep -Seconds 3
 $b = Start-Instance "b" @(
   "`"--user_data_root=$Root\userdata_b`"", "--net_port=3075",
-  "--net_xuid=2533274790395906", "--net_gamertag=SuperstarB",
-  "--input_backend=none", "--mnk_mode=true"
-)
+  "--net_xuid=2533274790395906", "--net_gamertag=SuperstarB"
+) + $(if ($BInput -eq "keyboard") { @("--input_backend=none", "--mnk_mode=true") } else { @() })
 
 Write-Host "`nOn one instance: Xbox LIVE > host a match (create). On the other: Xbox LIVE > find a match."
 Write-Host "Close both windows when done$(if ($Seconds) { ", or wait $Seconds s" })."
@@ -82,6 +84,8 @@ foreach ($tag in @("a", "b")) {
       Write-Host ("  [ ] {0}" -f $step.Key) -ForegroundColor DarkGray
     }
   }
+  $online = $text | Select-String -Pattern '\[online\] state' | Select-Object -First 12
+  if ($online) { Write-Host "  online menu states:" -ForegroundColor DarkCyan; foreach ($l in $online) { Write-Host ("    " + $l.Line.Substring(26, [Math]::Min(150, $l.Line.Length - 26))) } }
   $problems = $text | Select-String -Pattern '\[net\].*(error|fail|unexpected|short buffer|no answer)|Unimplemented XGI|\[(critical)\]' |
     Select-Object -First 8
   foreach ($line in $problems) { Write-Host ("  ! " + $line.Line.Substring(0, [Math]::Min(170, $line.Line.Length))) -ForegroundColor Yellow }
