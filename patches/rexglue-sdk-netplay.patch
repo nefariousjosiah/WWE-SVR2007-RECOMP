@@ -1,9 +1,9 @@
 diff --git a/include/rex/kernel/xam/xnet.h b/include/rex/kernel/xam/xnet.h
 new file mode 100644
-index 0000000..6505988
+index 0000000..ef9a495
 --- /dev/null
 +++ b/include/rex/kernel/xam/xnet.h
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,34 @@
 +/**
 + * @file        kernel/xam/xnet.h
 + * @brief       XNet pieces shared between xam_net.cpp and the XGI session app
@@ -32,6 +32,10 @@ index 0000000..6505988
 +
 +// Random bytes (peers must not generate the same IDs).
 +void FillRandom(void* buffer, size_t length);
++
++// This instance's port offset (net_port - 3074): 0 for the first instance on a
++// PC, 1 for a second one, ...
++int32_t LocalPortOffset();
 +
 +}  // namespace rex::kernel::xam
 diff --git a/include/rex/system/xam/profile_slot.h b/include/rex/system/xam/profile_slot.h
@@ -275,11 +279,146 @@ index 0000000..61f3a74
 +};
 +
 +}  // namespace rex::system
+diff --git a/include/rex/system/xsession_discovery.h b/include/rex/system/xsession_discovery.h
+new file mode 100644
+index 0000000..5c169b4
+--- /dev/null
++++ b/include/rex/system/xsession_discovery.h
+@@ -0,0 +1,129 @@
++/**
++ * @file        system/xsession_discovery.h
++ * @brief       Finding hosted sessions without Xbox LIVE: LAN / same-PC discovery
++ *
++ * A host answers queries on UDP kDiscoveryBasePort + its port offset (3070 for
++ * the first instance on a PC, 3071 for the second, ...). A search sends a query
++ * to the broadcast address, to 127.0.0.1 and to net_host_ip, on every
++ * instance's port, and collects the hosts' adverts. The advert carries what
++ * XSessionSearch and XNetQosLookup hand the title: the session's XSESSION_INFO,
++ * slot counts, the host's contexts and properties, and its QoS listen data.
++ */
++#pragma once
++
++#include <array>
++#include <cstdint>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <vector>
++
++namespace rex::system {
++
++constexpr uint16_t kDiscoveryBasePort = 3070;
++// Instances per PC a search reaches (port offsets 0 .. kDiscoveryPorts - 1).
++constexpr int32_t kDiscoveryPorts = 4;
++// Bumped when the wire format changes; peers ignore other versions.
++constexpr uint8_t kDiscoveryVersion = 1;
++
++// XUSER_PROPERTY value as the guest stores it: the XUSER_DATA type byte and
++// its 8-byte payload, still big-endian. Only fixed-size types travel
++// (CONTEXT, INT32, INT64, DOUBLE, FLOAT, DATETIME).
++struct SessionProperty {
++  uint32_t id = 0;
++  uint8_t type = 0;
++  std::array<uint8_t, 8> value{};
++
++  bool operator==(const SessionProperty&) const = default;
++};
++
++struct SessionContext {
++  uint32_t id = 0;
++  uint32_t value = 0;
++
++  bool operator==(const SessionContext&) const = default;
++};
++
++struct SessionAdvert {
++  uint32_t title_id = 0;
++  // XSESSION_INFO: XNKID, the host's XNADDR, XNKEY (guest layout).
++  std::array<uint8_t, 60> session_info{};
++  uint32_t open_public = 0;
++  uint32_t open_private = 0;
++  uint32_t filled_public = 0;
++  uint32_t filled_private = 0;
++  std::string host_gamertag;
++  std::vector<SessionContext> contexts;
++  std::vector<SessionProperty> properties;
++  std::vector<uint8_t> qos_data;  // XNetQosListen data, for XNetQosLookup
++
++  uint64_t session_id() const;  // the XNKID as a number, for logs and lookups
++
++  bool operator==(const SessionAdvert&) const = default;
++};
++
++enum class DiscoveryPacket : uint8_t { kQuery = 1, kAdvert = 2 };
++
++// Wire format. Encode* never fail; Decode* return nullopt for anything that
++// isn't a well-formed packet of this version for this title.
++std::vector<uint8_t> EncodeQuery(uint32_t title_id, uint32_t nonce);
++std::optional<uint32_t> DecodeQuery(const uint8_t* data, size_t size, uint32_t title_id);
++std::vector<uint8_t> EncodeAdvert(const SessionAdvert& advert, uint32_t nonce);
++std::optional<SessionAdvert> DecodeAdvert(const uint8_t* data, size_t size, uint32_t title_id,
++                                          uint32_t* nonce_out = nullptr);
++
++struct FoundSession {
++  SessionAdvert advert;
++  uint32_t from_ip = 0;  // host order
++  uint16_t from_port = 0;
++  uint32_t rtt_ms = 0;
++};
++
++// The discovery socket and its answering thread; one per process.
++class SessionDiscovery {
++ public:
++  static SessionDiscovery& Get();
++
++  // Binds kDiscoveryBasePort + port_offset. Safe to call again (no-op).
++  bool Start(uint32_t title_id, int32_t port_offset);
++
++  // The session this instance hosts, answered to queries; nullopt stops.
++  void SetHosted(std::optional<SessionAdvert> advert);
++  std::optional<SessionAdvert> hosted() const;
++
++  // XNetQosListen's data for a session, sent with its advert (the title may
++  // set it before or after creating the session).
++  void SetQosData(uint64_t session_id, std::vector<uint8_t> data);
++
++  // Queries every target and waits up to timeout_ms for adverts. Our own
++  // hosted session is left out. Results are also kept for Find().
++  std::vector<FoundSession> Search(uint32_t timeout_ms);
++
++  // A session seen by the last searches, by XNKID.
++  std::optional<FoundSession> Find(uint64_t session_id) const;
++
++  // Asks one host directly (XNetQosLookup for a session not searched for).
++  std::optional<FoundSession> Probe(uint32_t ip, int32_t port_offset, uint64_t session_id,
++                                    uint32_t timeout_ms);
++
++ private:
++  SessionDiscovery() = default;
++  void ReceiveLoop();
++  std::vector<FoundSession> Collect(const std::vector<std::pair<uint32_t, uint16_t>>& targets,
++                                    uint32_t timeout_ms, std::optional<uint64_t> want);
++
++  mutable std::mutex mutex_;
++  bool started_ = false;
++  uint32_t title_id_ = 0;
++  int32_t port_offset_ = 0;
++  intptr_t socket_ = -1;
++  std::optional<SessionAdvert> hosted_;
++  std::vector<std::pair<uint64_t, std::vector<uint8_t>>> qos_data_;
++  // Replies to the query in flight (nonce), gathered by ReceiveLoop.
++  uint32_t pending_nonce_ = 0;
++  uint64_t pending_sent_ms_ = 0;
++  std::vector<FoundSession> pending_;
++  std::vector<FoundSession> seen_;
++};
++
++}  // namespace rex::system
 diff --git a/src/kernel/xam/apps/xgi_app.cpp b/src/kernel/xam/apps/xgi_app.cpp
-index 2b222da..622e8c9 100644
+index 2b222da..e20d60b 100644
 --- a/src/kernel/xam/apps/xgi_app.cpp
 +++ b/src/kernel/xam/apps/xgi_app.cpp
-@@ -9,7 +9,12 @@
+@@ -9,10 +9,20 @@
   * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
   */
  
@@ -288,11 +427,19 @@ index 2b222da..622e8c9 100644
 +#include <fmt/format.h>
 +
  #include <rex/kernel/xam/apps/xgi_app.h>
++#include <rex/cvar.h>
 +#include <rex/kernel/xam/xnet.h>
  #include <rex/logging.h>
++#include <rex/system/xnet_address_table.h>
++#include <rex/system/xsession_discovery.h>
  #include <rex/thread.h>
  
-@@ -23,6 +28,23 @@ using namespace rex::system;
++REXCVAR_DECLARE(std::string, net_gamertag);
++
+ namespace rex {
+ namespace kernel {
+ namespace xam {
+@@ -23,6 +33,218 @@ using namespace rex::system;
  
  XgiApp::XgiApp(KernelState* kernel_state) : App(kernel_state, 0xFB) {}
  
@@ -311,12 +458,250 @@ index 2b222da..622e8c9 100644
 +  return out;
 +}
 +
++// How long XSessionSearch waits for hosts to answer.
++constexpr uint32_t kSearchTimeoutMs = 800;
++
++// Guest layouts (big-endian).
++constexpr uint32_t kSearchResultSize = 92;     // XSESSION_SEARCHRESULT
++constexpr uint32_t kUserContextSize = 8;       // XUSER_CONTEXT { id, value }
++constexpr uint32_t kUserPropertySize = 24;     // XUSER_PROPERTY { id, pad, XUSER_DATA }
++constexpr uint32_t kUserDataValueOffset = 16;  // XUSER_DATA's union, from the property start
++
++// XPROPERTYTYPEFROMID: the XUSER_DATA type is in the id's top nibble.
++uint8_t PropertyType(uint32_t id) {
++  return uint8_t((id >> 28) & 0xF);
++}
++bool IsFixedSizeType(uint8_t type) {
++  // CONTEXT, INT32, INT64, DOUBLE, FLOAT, DATETIME (UNICODE and BINARY point elsewhere).
++  return type == 0 || type == 1 || type == 2 || type == 3 || type == 5 || type == 7;
++}
++
++// What the signed-in user told XGI (XUserSetContext / XUserSetProperty). A
++// hosted session advertises these; titles key match types and lobby settings
++// on them.
++std::mutex g_user_mutex;
++std::vector<SessionContext> g_user_contexts;
++std::vector<SessionProperty> g_user_properties;
++
++// The session this instance hosts (XSessionCreate with the host flag).
++uint32_t g_hosted_session_ptr = 0;
++
++void StartDiscovery(KernelState* kernel_state) {
++  SessionDiscovery::Get().Start(kernel_state->title_id(), LocalPortOffset());
++}
++
++void Advertise(uint32_t session_ptr, const uint8_t* session_info, uint32_t public_slots,
++               uint32_t private_slots, KernelState* kernel_state) {
++  SessionAdvert advert;
++  advert.title_id = kernel_state->title_id();
++  std::memcpy(advert.session_info.data(), session_info, kSessionInfoSize);
++  advert.open_public = public_slots;
++  advert.open_private = private_slots;
++  advert.host_gamertag = REXCVAR_GET(net_gamertag);
++  {
++    std::lock_guard lock(g_user_mutex);
++    advert.contexts = g_user_contexts;
++    advert.properties = g_user_properties;
++  }
++  StartDiscovery(kernel_state);
++  g_hosted_session_ptr = session_ptr;
++  SessionDiscovery::Get().SetHosted(std::move(advert));
++}
++
++// A player joined (+1) or left (-1) the session we host.
++void AdjustHostedSlots(uint32_t session_ptr, int delta, bool private_slot) {
++  if (!session_ptr || session_ptr != g_hosted_session_ptr) {
++    return;
++  }
++  auto& discovery = SessionDiscovery::Get();
++  auto advert = discovery.hosted();
++  if (!advert) {
++    return;
++  }
++  auto& open = private_slot ? advert->open_private : advert->open_public;
++  auto& filled = private_slot ? advert->filled_private : advert->filled_public;
++  if (delta > 0 && open > 0) {
++    --open;
++    ++filled;
++  } else if (delta < 0 && filled > 0) {
++    ++open;
++    --filled;
++  }
++  discovery.SetHosted(std::move(advert));
++}
++
++std::string DescribeContexts(memory::Memory* memory, uint32_t ptr, uint32_t count) {
++  std::string out;
++  for (uint32_t i = 0; ptr && i < count && i < 32; ++i) {
++    auto c = memory->TranslateVirtual(ptr + i * kUserContextSize);
++    out += fmt::format("{}{:08X}={}", out.empty() ? "" : " ", memory::load_and_swap<uint32_t>(c),
++                       memory::load_and_swap<uint32_t>(c + 4));
++  }
++  return out.empty() ? "none" : out;
++}
++
++std::string DescribeProperties(memory::Memory* memory, uint32_t ptr, uint32_t count) {
++  std::string out;
++  for (uint32_t i = 0; ptr && i < count && i < 32; ++i) {
++    auto p = memory->TranslateVirtual(ptr + i * kUserPropertySize);
++    out += fmt::format("{}{:08X}=type {} {}", out.empty() ? "" : " ",
++                       memory::load_and_swap<uint32_t>(p), p[8], Hex(p + kUserDataValueOffset, 8));
++  }
++  return out.empty() ? "none" : out;
++}
++
++// XSessionSearch / XSessionSearchEx (same first 32 bytes): asks the hosts on
++// this LAN, this PC and net_host_ip, and writes what they advertise.
++X_HRESULT SearchSessions(const char* name, uint8_t* buffer, uint32_t buffer_length,
++                         memory::Memory* memory, KernelState* kernel_state) {
++  if (buffer_length < 32) {
++    REXKRNL_WARN("[net] {}: short buffer ({} bytes)", name, buffer_length);
++    return X_E_INVALIDARG;
++  }
++  uint32_t proc_index = memory::load_and_swap<uint32_t>(buffer + 0);
++  uint32_t user_index = memory::load_and_swap<uint32_t>(buffer + 4);
++  uint32_t max_results = memory::load_and_swap<uint32_t>(buffer + 8);
++  uint16_t num_props = memory::load_and_swap<uint16_t>(buffer + 12);
++  uint16_t num_ctx = memory::load_and_swap<uint16_t>(buffer + 14);
++  uint32_t props_ptr = memory::load_and_swap<uint32_t>(buffer + 16);
++  uint32_t ctx_ptr = memory::load_and_swap<uint32_t>(buffer + 20);
++  uint32_t results_size = memory::load_and_swap<uint32_t>(buffer + 24);
++  uint32_t results_ptr = memory::load_and_swap<uint32_t>(buffer + 28);
++  REXKRNL_INFO("[net] {}(query {}, user {}, up to {} results, {} byte buffer at {:08X}); "
++               "contexts: {}; properties: {}",
++               name, proc_index, user_index, max_results, results_size, results_ptr,
++               DescribeContexts(memory, ctx_ptr, num_ctx),
++               DescribeProperties(memory, props_ptr, num_props));
++  // Guest heap pointers are far above 64 KB; anything lower means the layout
++  // is not what we think, and writing through it would corrupt memory.
++  if (results_ptr < 0x10000) {
++    REXKRNL_ERROR("[net] {}: unexpected argument layout (results {:08X}); not writing results",
++                  name, results_ptr);
++    return X_E_INVALIDARG;
++  }
++  // XSESSION_SEARCHRESULT_HEADER { DWORD dwSearchResults; RESULT* pResults; }
++  constexpr uint32_t kHeaderSize = 8;
++  if (results_size < kHeaderSize) {
++    REXKRNL_WARN("[net] {}: {} byte buffer can't hold the result header", name, results_size);
++    return kInsufficientBuffer;
++  }
++
++  StartDiscovery(kernel_state);
++  auto found = SessionDiscovery::Get().Search(kSearchTimeoutMs);
++  // Sessions with no open slot can't be joined; don't offer them.
++  found.erase(std::remove_if(found.begin(), found.end(),
++                             [](const FoundSession& f) {
++                               return f.advert.open_public + f.advert.open_private == 0;
++                             }),
++              found.end());
++
++  // Results first, then each result's properties and contexts.
++  uint32_t count = 0;
++  uint32_t needed = kHeaderSize;
++  for (const auto& f : found) {
++    uint32_t size = kSearchResultSize + uint32_t(f.advert.contexts.size()) * kUserContextSize +
++                    uint32_t(f.advert.properties.size()) * kUserPropertySize;
++    if (count >= max_results || needed + size > results_size) {
++      break;
++    }
++    needed += size;
++    ++count;
++  }
++  auto header = memory->TranslateVirtual(results_ptr);
++  const uint32_t first_result = results_ptr + kHeaderSize;
++  uint32_t extra = first_result + count * kSearchResultSize;
++  std::memset(header, 0, needed);
++  memory::store_and_swap<uint32_t>(header + 0, count);
++  memory::store_and_swap<uint32_t>(header + 4, count ? first_result : 0);
++  for (uint32_t i = 0; i < count; ++i) {
++    const auto& a = found[i].advert;
++    auto r = memory->TranslateVirtual(first_result + i * kSearchResultSize);
++    std::memcpy(r, a.session_info.data(), kSessionInfoSize);
++    memory::store_and_swap<uint32_t>(r + 60, a.open_public);
++    memory::store_and_swap<uint32_t>(r + 64, a.open_private);
++    memory::store_and_swap<uint32_t>(r + 68, a.filled_public);
++    memory::store_and_swap<uint32_t>(r + 72, a.filled_private);
++    memory::store_and_swap<uint32_t>(r + 76, uint32_t(a.properties.size()));
++    memory::store_and_swap<uint32_t>(r + 80, uint32_t(a.contexts.size()));
++    const uint32_t props_va = a.properties.empty() ? 0 : extra;
++    for (const auto& prop : a.properties) {
++      auto p = memory->TranslateVirtual(extra);
++      memory::store_and_swap<uint32_t>(p, prop.id);
++      p[8] = prop.type;
++      std::memcpy(p + kUserDataValueOffset, prop.value.data(), 8);
++      extra += kUserPropertySize;
++    }
++    const uint32_t ctx_va = a.contexts.empty() ? 0 : extra;
++    for (const auto& ctx : a.contexts) {
++      auto c = memory->TranslateVirtual(extra);
++      memory::store_and_swap<uint32_t>(c, ctx.id);
++      memory::store_and_swap<uint32_t>(c + 4, ctx.value);
++      extra += kUserContextSize;
++    }
++    memory::store_and_swap<uint32_t>(r + 84, props_va);
++    memory::store_and_swap<uint32_t>(r + 88, ctx_va);
++    REXKRNL_INFO("[net] {}: result {} = session {:016X} hosted by '{}' ({}/{} public open)", name,
++                 i, a.session_id(), a.host_gamertag, a.open_public,
++                 a.open_public + a.filled_public);
++  }
++  if (count < found.size()) {
++    REXKRNL_WARN("[net] {}: {} of {} sessions fit (max {} results, {} byte buffer)", name, count,
++                 found.size(), max_results, results_size);
++  }
++  REXKRNL_INFO("[net] {}(query {}) -> {} session(s)", name, proc_index, count);
++  return X_E_SUCCESS;
++}
++
++
 +}  // namespace
 +
  // http://mb.mirage.org/bugzilla/xliveless/main.c
  
  X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
-@@ -113,6 +135,29 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -42,6 +264,16 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       uint32_t context_value = memory::load_and_swap<uint32_t>(buffer + 20);
+       REXKRNL_DEBUG("XGIUserSetContextEx({:08X}, {:08X}, {:08X})", user_index, context_id,
+                     context_value);
++      if (user_index == 0) {
++        std::lock_guard lock(g_user_mutex);
++        auto it = std::find_if(g_user_contexts.begin(), g_user_contexts.end(),
++                               [&](const SessionContext& c) { return c.id == context_id; });
++        if (it != g_user_contexts.end()) {
++          it->value = context_value;
++        } else {
++          g_user_contexts.push_back({context_id, context_value});
++        }
++      }
+       return X_E_SUCCESS;
+     }
+     case 0x000B0007: {
+@@ -51,6 +283,25 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       uint32_t value_ptr = memory::load_and_swap<uint32_t>(buffer + 24);
+       REXKRNL_DEBUG("XGIUserSetPropertyEx({:08X}, {:08X}, {}, {:08X})", user_index, property_id,
+                     value_size, value_ptr);
++      const uint8_t type = PropertyType(property_id);
++      if (user_index == 0 && value_ptr && IsFixedSizeType(type) &&
++          (value_size == 4 || value_size == 8)) {
++        SessionProperty prop;
++        prop.id = property_id;
++        prop.type = type;
++        std::memcpy(prop.value.data(), memory_->TranslateVirtual(value_ptr), value_size);
++        std::lock_guard lock(g_user_mutex);
++        auto it = std::find_if(g_user_properties.begin(), g_user_properties.end(),
++                               [&](const SessionProperty& p) { return p.id == property_id; });
++        if (it != g_user_properties.end()) {
++          *it = prop;
++        } else {
++          g_user_properties.push_back(prop);
++        }
++      } else if (user_index == 0) {
++        REXKRNL_DEBUG("[net] property {:08X} (type {}, {} bytes) not advertised", property_id,
++                      type, value_size);
++      }
+       return X_E_SUCCESS;
+     }
+     case 0x000B0008: {
+@@ -113,6 +364,30 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
            "{:08X})",
            session_ptr, flags, num_slots_public, num_slots_private, user_xuid, session_info_ptr,
            nonce_ptr);
@@ -337,6 +722,7 @@ index 2b222da..622e8c9 100644
 +        REXKRNL_INFO("[net] XSessionCreate: hosting session {} ({} public, {} private slots, "
 +                     "flags {:08X})",
 +                     Hex(info, kXnKidSize), num_slots_public, num_slots_private, flags);
++        Advertise(session_ptr, info, num_slots_public, num_slots_private, kernel_state_);
 +      } else {
 +        REXKRNL_WARN("[net] XSessionCreate: host without a session info buffer");
 +      }
@@ -346,7 +732,40 @@ index 2b222da..622e8c9 100644
        return X_E_SUCCESS;
      }
      case 0x000B0011: {
-@@ -194,28 +239,6 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -123,6 +398,10 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       uint64_t session_nonce = memory::load_and_swap<uint64_t>(buffer + 8);
+ 
+       REXKRNL_DEBUG("XGISessionDelete({:08X}, {:08X}, {:016X})", obj_ptr, flags, session_nonce);
++      if (obj_ptr && obj_ptr == g_hosted_session_ptr) {
++        g_hosted_session_ptr = 0;
++        SessionDiscovery::Get().SetHosted(std::nullopt);
++      }
+ 
+       return X_E_SUCCESS;
+     }
+@@ -138,6 +417,12 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       REXKRNL_DEBUG("{}({:08X}, {}, {}, {:08X}, {:08X})",
+                     is_local ? "XGISessionJoinLocal" : "XGISessionJoinRemote", session_ptr,
+                     user_count, xuid_array_ptr, user_index_array, private_slots_array);
++      for (uint32_t i = 0; i < user_count && i < 4; ++i) {
++        bool private_slot = private_slots_array && memory::load_and_swap<uint32_t>(
++                                                       memory_->TranslateVirtual(
++                                                           private_slots_array + i * 4)) != 0;
++        AdjustHostedSlots(session_ptr, +1, private_slot);
++      }
+       return X_E_SUCCESS;
+     }
+     case 0x000B0014: {
+@@ -179,7 +464,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       REXKRNL_DEBUG("XSessionSearch({}, {}, {}, {}, {}, {:08X}, {:08X}, {}, {:08X})", proc_index,
+                     user_index, num_results, num_props, num_ctx, props_ptr, ctx_ptr,
+                     results_buffer_size, search_results_ptr);
+-      return X_E_SUCCESS;
++      return SearchSessions("XSessionSearch", buffer, buffer_length, memory_, kernel_state_);
+     }
+     case 0x000B0018: {
+       assert_true(!buffer_length || buffer_length == 16);
+@@ -194,28 +479,6 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
  
        return X_E_SUCCESS;
      }
@@ -375,7 +794,7 @@ index 2b222da..622e8c9 100644
      case 0x000B001D: {
        assert_true(!buffer_length || buffer_length == 24);
  
-@@ -445,6 +468,70 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -445,6 +708,15 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        REXKRNL_DEBUG("XGI 0x000B0071, unimplemented");
        return X_E_SUCCESS;
      }
@@ -385,63 +804,8 @@ index 2b222da..622e8c9 100644
 +      return X_E_SUCCESS;
 +    }
 +    case 0x000B001C: {
-+      // XSessionSearch, as SVR07 sends it (36 bytes):
-+      //   +0 procedure index   +4 user index   +8 max results
-+      //   +12 u16 property count, u16 context count
-+      //   +16 properties   +20 contexts
-+      //   +24 results buffer size (a value, not a pointer)
-+      //   +28 results buffer   +32 1 (unknown)
-+      if (buffer_length < 32) {
-+        REXKRNL_WARN("[net] XSessionSearch: short buffer ({} bytes)", buffer_length);
-+        return X_E_INVALIDARG;
-+      }
-+      REXKRNL_DEBUG("[net] XSessionSearch raw: {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} "
-+                    "{:08X}{}",
-+                    memory::load_and_swap<uint32_t>(buffer + 0),
-+                    memory::load_and_swap<uint32_t>(buffer + 4),
-+                    memory::load_and_swap<uint32_t>(buffer + 8),
-+                    memory::load_and_swap<uint32_t>(buffer + 12),
-+                    memory::load_and_swap<uint32_t>(buffer + 16),
-+                    memory::load_and_swap<uint32_t>(buffer + 20),
-+                    memory::load_and_swap<uint32_t>(buffer + 24),
-+                    memory::load_and_swap<uint32_t>(buffer + 28),
-+                    buffer_length >= 36
-+                        ? fmt::format(" {:08X}", memory::load_and_swap<uint32_t>(buffer + 32))
-+                        : std::string());
-+      uint32_t proc_index = memory::load_and_swap<uint32_t>(buffer + 0);
-+      uint32_t user_index = memory::load_and_swap<uint32_t>(buffer + 4);
-+      uint32_t num_results = memory::load_and_swap<uint32_t>(buffer + 8);
-+      uint16_t num_props = memory::load_and_swap<uint16_t>(buffer + 12);
-+      uint16_t num_ctx = memory::load_and_swap<uint16_t>(buffer + 14);
-+      uint32_t results_size = memory::load_and_swap<uint32_t>(buffer + 24);
-+      uint32_t results_ptr = memory::load_and_swap<uint32_t>(buffer + 28);
-+      REXKRNL_DEBUG("[net] XSessionSearch(query {}, user {}, up to {} results, {} props, {} "
-+                    "contexts, {} byte buffer at {:08X})",
-+                    proc_index, user_index, num_results, num_props, num_ctx, results_size,
-+                    results_ptr);
-+      // Guest heap pointers are far above 64 KB; anything lower means the
-+      // layout is not what we think, and writing through it would corrupt
-+      // memory.
-+      if (results_ptr < 0x10000) {
-+        REXKRNL_ERROR("[net] XSessionSearch: unexpected argument layout (results {:08X}); not "
-+                      "writing results",
-+                      results_ptr);
-+        return X_E_INVALIDARG;
-+      }
-+      // XSESSION_SEARCHRESULT_HEADER { DWORD dwSearchResults; RESULT* pResults; }
-+      constexpr uint32_t kHeaderSize = 8;
-+      if (results_size < kHeaderSize) {
-+        REXKRNL_WARN("[net] XSessionSearch: {} byte buffer can't hold the result header",
-+                     results_size);
-+        return kInsufficientBuffer;
-+      }
-+      auto header = memory_->TranslateVirtual(results_ptr);
-+      memory::store_and_swap<uint32_t>(header + 0, 0);
-+      memory::store_and_swap<uint32_t>(header + 4, results_ptr + kHeaderSize);
-+      REXKRNL_INFO("[net] XSessionSearch(query {}) -> 0 sessions (LAN discovery not implemented "
-+                   "yet)",
-+                   proc_index);
-+      return X_E_SUCCESS;
++      // XSessionSearchEx, as SvR sends it (36 bytes: XSessionSearch's 32 plus a user count).
++      return SearchSessions("XSessionSearchEx", buffer, buffer_length, memory_, kernel_state_);
 +    }
    }
    REXKRNL_ERROR(
@@ -582,7 +946,7 @@ index 80c3634..0d01b5c 100644
    return result;
  }
 diff --git a/src/kernel/xam/xam_net.cpp b/src/kernel/xam/xam_net.cpp
-index 58e36a4..d0b94e0 100644
+index 58e36a4..7f20c60 100644
 --- a/src/kernel/xam/xam_net.cpp
 +++ b/src/kernel/xam/xam_net.cpp
 @@ -13,14 +13,23 @@
@@ -609,17 +973,18 @@ index 58e36a4..d0b94e0 100644
  #include <rex/kernel/xboxkrnl/error.h>
  #include <rex/kernel/xboxkrnl/threading.h>
  #include <rex/logging.h>
-@@ -28,7 +37,9 @@
+@@ -28,7 +37,10 @@
  #include <rex/types.h>
  #include <rex/string.h>
  #include <rex/system/kernel_state.h>
 +#include <rex/system/xam/user_profile.h>
  #include <rex/system/xevent.h>
 +#include <rex/system/xnet_address_table.h>
++#include <rex/system/xsession_discovery.h>
  #include <rex/system/xsocket.h>
  #include <rex/system/xthread.h>
  #include <rex/system/xtypes.h>
-@@ -37,13 +48,21 @@
+@@ -37,13 +49,24 @@
  // NOTE: must be included last as it expects windows.h to already be included.
  #define _WINSOCK_DEPRECATED_NO_WARNINGS  // inet_addr
  #include <winsock2.h>                    // NOLINT(build/include_order)
@@ -637,11 +1002,14 @@ index 58e36a4..d0b94e0 100644
 +                      "with 3075 to test multiplayer locally");
 +REXCVAR_DEFINE_STRING(net_ip, "", "Net",
 +                      "IPv4 address to advertise to peers; auto-detected when empty");
++REXCVAR_DEFINE_STRING(net_host_ip, "", "Net",
++                      "IPv4 address of a host to look for sessions on, besides this LAN and PC "
++                      "(e.g. a friend's address for direct-IP play)");
 +
  namespace rex {
  namespace kernel {
  namespace xam {
-@@ -95,6 +114,137 @@ typedef struct {
+@@ -95,6 +118,143 @@ typedef struct {
    XNQOSINFO info[1];
  } XNQOS;
  
@@ -662,6 +1030,12 @@ index 58e36a4..d0b94e0 100644
 +constexpr uint32_t XNET_CONNECT_STATUS_CONNECTED = 2;
 +
 +constexpr uint32_t kWSAEINVAL = 0x2726;
++
++XNetAddressTable& xnet_table();
++
++int32_t LocalPortOffset() {
++  return xnet_table().local_port_offset();
++}
 +
 +XNetAddressTable& xnet_table() {
 +  static XNetAddressTable* table = [] {
@@ -779,17 +1153,19 @@ index 58e36a4..d0b94e0 100644
  struct Xsockaddr_t {
    rex::be<uint16_t> sa_family;
    char sa_data[14];
-@@ -187,6 +337,9 @@ u32 NetDll_XNetStartup_entry(u32 caller, ppc_ptr_t<XNetStartupParams> params) {
+@@ -187,6 +347,11 @@ u32 NetDll_XNetStartup_entry(u32 caller, ppc_ptr_t<XNetStartupParams> params) {
      assert_true(params->cfgSizeOfStruct == sizeof(XNetStartupParams));
      std::memcpy(&xnet_startup_params, params, sizeof(XNetStartupParams));
    }
 +  REXKRNL_INFO("[net] XNetStartup(flags {:02X}, qos timeout {}s) port offset {}, online {}",
 +               xnet_startup_params.cfgFlags, xnet_startup_params.cfgQosProbeTimeoutInSeconds,
 +               xnet_table().local_port_offset(), IsSignedInOnline());
++  // Listen for session searches from the start, so a port clash shows at boot.
++  SessionDiscovery::Get().Start(REX_KERNEL_STATE()->title_id(), xnet_table().local_port_offset());
  
    auto xam = REX_KERNEL_STATE()->GetKernelModule<XamModule>("xam.xex");
  
-@@ -231,9 +384,9 @@ u32 NetDll_XNetGetOpt_entry(u32 one, u32 option_id, mapped_void buffer_ptr,
+@@ -231,9 +396,9 @@ u32 NetDll_XNetGetOpt_entry(u32 one, u32 option_id, mapped_void buffer_ptr,
  }
  
  u32 NetDll_XNetRandom_entry(u32 caller, mapped_void buffer_ptr, u32 length) {
@@ -802,7 +1178,7 @@ index 58e36a4..d0b94e0 100644
  
    return 0;
  }
-@@ -323,7 +476,7 @@ u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buf
+@@ -323,7 +488,7 @@ u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buf
    assert(!overlapped);
    assert(!completion_routine);
  
@@ -811,7 +1187,7 @@ index 58e36a4..d0b94e0 100644
    if (!socket) {
      // WSAENOTSOCK
      XThread::SetLastError(0x2736);
-@@ -345,8 +498,16 @@ u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buf
+@@ -345,8 +510,16 @@ u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buf
      combined_buffer_offset += buffers[i].len;
    }
  
@@ -830,7 +1206,7 @@ index 58e36a4..d0b94e0 100644
  
    // TODO: Instantly complete overlapped
  
-@@ -435,11 +596,17 @@ struct XnAddrStatus {
+@@ -435,11 +608,17 @@ struct XnAddrStatus {
    static const uint32_t XNET_GET_XNADDR_TROUBLESHOOT = 0x00008000;
  };
  
@@ -853,7 +1229,7 @@ index 58e36a4..d0b94e0 100644
  
    // TODO(gibbed): A proper mac address.
    // RakNet's 360 version appears to depend on abEnet to create "random" 64-bit
-@@ -452,11 +619,33 @@ u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
+@@ -452,11 +631,33 @@ u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
    // https://github.com/facebookarchive/RakNet/blob/master/Source/RakPeer.cpp#L4467
    // "Mac address is a poor solution because you can't have multiple connections
    // from the same system"
@@ -871,7 +1247,8 @@ index 58e36a4..d0b94e0 100644
 +  for (int i = 0; i < 8; ++i) {
 +    addr_ptr->abOnline[i] = static_cast<uint8_t>(xuid >> (56 - 8 * i));
 +  }
-+
+ 
+-  return XnAddrStatus::XNET_GET_XNADDR_STATIC;
 +  uint32_t status = XnAddrStatus::XNET_GET_XNADDR_STATIC | XnAddrStatus::XNET_GET_XNADDR_GATEWAY |
 +                    XnAddrStatus::XNET_GET_XNADDR_DNS;
 +  if (IsSignedInOnline()) {
@@ -879,8 +1256,7 @@ index 58e36a4..d0b94e0 100644
 +  }
 +  return status;
 +}
- 
--  return XnAddrStatus::XNET_GET_XNADDR_STATIC;
++
 +u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
 +  uint32_t status = FillTitleXnAddr(reinterpret_cast<uint8_t*>(addr_ptr.host_address()));
 +  REXKRNL_DEBUG("[net] XNetGetTitleXnAddr -> {}:{} status {:08X}",
@@ -889,7 +1265,7 @@ index 58e36a4..d0b94e0 100644
  }
  
  u32 NetDll_XNetGetDebugXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
-@@ -471,23 +660,117 @@ u32 NetDll_XNetXnAddrToMachineId_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr, m
+@@ -471,23 +672,117 @@ u32 NetDll_XNetXnAddrToMachineId_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr, m
    return 1;
  }
  
@@ -1018,7 +1394,7 @@ index 58e36a4..d0b94e0 100644
  }
  
  // https://www.google.com/patents/WO2008112448A1?cl=en
-@@ -506,10 +789,14 @@ struct XEthernetStatus {
+@@ -506,10 +801,14 @@ struct XEthernetStatus {
  };
  
  u32 NetDll_XNetGetEthernetLinkStatus_entry(u32 caller) {
@@ -1034,7 +1410,7 @@ index 58e36a4..d0b94e0 100644
    // TODO(gibbed): actually implement this
    if (pdns) {
      auto dns_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(sizeof(XNDNS));
-@@ -534,6 +821,7 @@ u32 NetDll_XNetDnsRelease_entry(u32 caller, ppc_ptr_t<XNDNS> dns) {
+@@ -534,6 +833,7 @@ u32 NetDll_XNetDnsRelease_entry(u32 caller, ppc_ptr_t<XNDNS> dns) {
  }
  
  u32 NetDll_XNetQosServiceLookup_entry(u32 caller, u32 flags, u32 event_handle, mapped_u32 pqos) {
@@ -1042,7 +1418,7 @@ index 58e36a4..d0b94e0 100644
    // Set pqos as some games will try accessing it despite non-successful result
    if (pqos) {
      auto qos_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(sizeof(XNQOS));
-@@ -557,9 +845,59 @@ u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) {
+@@ -557,9 +857,164 @@ u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) {
    return 0;
  }
  
@@ -1079,6 +1455,7 @@ index 58e36a4..d0b94e0 100644
 +  std::lock_guard<std::mutex> lock(qos_mutex);
 +  if (flags & XNET_QOS_LISTEN_RELEASE) {
 +    qos_listeners.erase(key);
++    SessionDiscovery::Get().SetQosData(key, {});
 +    REXKRNL_DEBUG("[net] XNetQosListen(session {:016X}) -> released", key);
 +    return 0;
 +  }
@@ -1086,6 +1463,8 @@ index 58e36a4..d0b94e0 100644
 +  if (flags & XNET_QOS_LISTEN_SET_DATA) {
 +    auto bytes = data ? data.as<uint8_t*>() : nullptr;
 +    listener.data.assign(bytes, bytes ? bytes + uint32_t(data_size) : nullptr);
++    // Joiners get it back from XNetQosLookup through the session's advert.
++    SessionDiscovery::Get().SetQosData(key, listener.data);
 +  }
 +  if (flags & XNET_QOS_LISTEN_SET_BITSPERSEC) {
 +    listener.bits_per_sec = bits_per_sec;
@@ -1102,10 +1481,112 @@ index 58e36a4..d0b94e0 100644
 +      key, uint32_t(flags), listener.enabled ? "enabled" : "disabled", listener.data.size(),
 +      fmt::join(listener.data, ""), listener.bits_per_sec);
 +  return 0;
++}
++
++constexpr uint8_t XNET_XNQOSINFO_COMPLETE = 0x01;
++constexpr uint8_t XNET_XNQOSINFO_TARGET_CONTACTED = 0x02;
++constexpr uint8_t XNET_XNQOSINFO_DATA_RECEIVED = 0x08;
++
++// Probes hosts before joining: is the host there, how far, and its listen
++// data (lobby settings). Answered from session discovery: the advert seen by
++// the last search, or a direct query to the host. Completes before returning.
++u32 NetDll_XNetQosLookup_entry(u32 caller, u32 xnaddr_count, u32 xnaddrs_ptr, u32 xnkids_ptr,
++                               u32 xnkeys_ptr, u32 ina_count, u32 inas_ptr, u32 service_ids_ptr,
++                               u32 probes, u32 bits_per_sec, u32 flags, u32 event_handle,
++                               mapped_u32 pqos) {
++  auto* mem = REX_KERNEL_MEMORY();
++  auto& discovery = SessionDiscovery::Get();
++  discovery.Start(REX_KERNEL_STATE()->title_id(), xnet_table().local_port_offset());
++
++  struct Answer {
++    std::optional<FoundSession> found;
++  };
++  std::vector<Answer> answers(xnaddr_count);
++  size_t data_bytes = 0;
++  for (uint32_t i = 0; i < xnaddr_count; ++i) {
++    uint32_t xnaddr_va = xnaddrs_ptr ? memory::load_and_swap<uint32_t>(
++                                           mem->TranslateVirtual(xnaddrs_ptr + i * 4))
++                                     : 0;
++    uint32_t xnkid_va = xnkids_ptr ? memory::load_and_swap<uint32_t>(
++                                         mem->TranslateVirtual(xnkids_ptr + i * 4))
++                                   : 0;
++    if (!xnaddr_va || !xnkid_va) {
++      continue;
++    }
++    auto* xnaddr = mem->TranslateVirtual<XNADDR*>(xnaddr_va);
++    auto* kid = mem->TranslateVirtual<uint8_t*>(xnkid_va);
++    uint64_t session_id = 0;
++    for (int b = 0; b < 8; ++b) {
++      session_id = session_id << 8 | kid[b];
++    }
++    uint32_t ip = LoadInAddr(xnaddr->inaOnline);
++    int32_t offset = XNetAddressTable::OffsetFromAdvertisedPort(xnaddr->wPortOnline);
++    auto found = discovery.Find(session_id);
++    if (!found) {
++      found = discovery.Probe(ip, offset, session_id, 500);
++    }
++    REXKRNL_INFO("[net] XNetQosLookup #{}: session {:016X} at {}:{} -> {}", i, session_id,
++                 FormatIPv4(ip), XNetAddressTable::AdvertisedPort(offset),
++                 found ? fmt::format("contacted, {} ms, {} data bytes", found->rtt_ms,
++                                     found->advert.qos_data.size())
++                       : std::string("no answer"));
++    if (found) {
++      data_bytes += found->advert.qos_data.size();
++    }
++    answers[i].found = std::move(found);
++  }
++  if (ina_count) {
++    REXKRNL_WARN("[net] XNetQosLookup: {} service (IN_ADDR) probes not supported", ina_count);
++  }
++
++  const uint32_t count = std::max<uint32_t>(xnaddr_count, 1);
++  const uint32_t header = uint32_t(offsetof(XNQOS, info) + sizeof(XNQOSINFO) * count);
++  const uint32_t qos_va = mem->SystemHeapAlloc(uint32_t(header + data_bytes));
++  auto* qos = mem->TranslateVirtual<XNQOS*>(qos_va);
++  std::memset(qos, 0, header + data_bytes);
++  qos->count = xnaddr_count;
++  qos->count_pending = 0;
++  uint32_t data_va = qos_va + header;
++  for (uint32_t i = 0; i < xnaddr_count; ++i) {
++    auto& info = qos->info[i];
++    info.flags = XNET_XNQOSINFO_COMPLETE;
++    if (!answers[i].found) {
++      continue;
++    }
++    const auto& f = *answers[i].found;
++    const uint16_t rtt = uint16_t(std::clamp<uint32_t>(f.rtt_ms, 1, 0xFFFF));
++    info.flags |= XNET_XNQOSINFO_TARGET_CONTACTED;
++    info.probes_xmit = uint16_t(std::max<uint32_t>(probes, 1));
++    info.probes_recv = uint16_t(std::max<uint32_t>(probes, 1));
++    info.rtt_min_in_msecs = rtt;
++    info.rtt_med_in_msecs = rtt;
++    // No bandwidth measurement; report a healthy broadband link.
++    info.up_bits_per_sec = 10'000'000;
++    info.down_bits_per_sec = 10'000'000;
++    if (!f.advert.qos_data.empty()) {
++      info.flags |= XNET_XNQOSINFO_DATA_RECEIVED;
++      info.data_len = uint16_t(f.advert.qos_data.size());
++      info.data_ptr = data_va;
++      std::memcpy(mem->TranslateVirtual(data_va), f.advert.qos_data.data(),
++                  f.advert.qos_data.size());
++      data_va += uint32_t(f.advert.qos_data.size());
++    }
++  }
++  if (pqos) {
++    *pqos = qos_va;
++  }
++  if (event_handle) {
++    if (auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle)) {
++      ev->Set(0, false);
++    }
++  }
++  REXKRNL_DEBUG("[net] XNetQosLookup({} hosts, {} probes, flags {:08X}) -> XNQOS {:08X}",
++                uint32_t(xnaddr_count), uint32_t(probes), uint32_t(flags), qos_va);
++  return 0;
  }
  
  u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
-@@ -588,15 +926,19 @@ u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
+@@ -588,15 +1043,19 @@ u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
      socket->Release();
  
      uint32_t error = xboxkrnl::xeRtlNtStatusToDosError(result);
@@ -1127,7 +1608,7 @@ index 58e36a4..d0b94e0 100644
    if (!socket) {
      // WSAENOTSOCK
      XThread::SetLastError(0x2736);
-@@ -611,7 +953,7 @@ u32 NetDll_closesocket_entry(u32 caller, u32 socket_handle) {
+@@ -611,7 +1070,7 @@ u32 NetDll_closesocket_entry(u32 caller, u32 socket_handle) {
  }
  
  i32 NetDll_shutdown_entry(u32 caller, u32 socket_handle, i32 how) {
@@ -1136,7 +1617,7 @@ index 58e36a4..d0b94e0 100644
    if (!socket) {
      // WSAENOTSOCK
      XThread::SetLastError(0x2736);
-@@ -632,7 +974,7 @@ i32 NetDll_shutdown_entry(u32 caller, u32 socket_handle, i32 how) {
+@@ -632,7 +1091,7 @@ i32 NetDll_shutdown_entry(u32 caller, u32 socket_handle, i32 how) {
  
  u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optname,
                              mapped_void optval_ptr, u32 optlen) {
@@ -1145,7 +1626,7 @@ index 58e36a4..d0b94e0 100644
    if (!socket) {
      // WSAENOTSOCK
      XThread::SetLastError(0x2736);
-@@ -644,7 +986,7 @@ u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optnam
+@@ -644,7 +1103,7 @@ u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optnam
  }
  
  u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void arg_ptr) {
@@ -1154,7 +1635,7 @@ index 58e36a4..d0b94e0 100644
    if (!socket) {
      // WSAENOTSOCK
      XThread::SetLastError(0x2736);
-@@ -662,7 +1004,7 @@ u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void
+@@ -662,7 +1121,7 @@ u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void
  }
  
  u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> name, u32 namelen) {
@@ -1163,7 +1644,7 @@ index 58e36a4..d0b94e0 100644
    if (!socket) {
      // WSAENOTSOCK
      XThread::SetLastError(0x2736);
-@@ -670,17 +1012,25 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
+@@ -670,17 +1129,25 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
    }
  
    N_XSOCKADDR_IN native_name(name);
@@ -1190,7 +1671,7 @@ index 58e36a4..d0b94e0 100644
    if (!socket) {
      // WSAENOTSOCK
      XThread::SetLastError(0x2736);
-@@ -688,6 +1038,17 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
+@@ -688,6 +1155,17 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
    }
  
    N_XSOCKADDR native_name(name);
@@ -1208,7 +1689,7 @@ index 58e36a4..d0b94e0 100644
    X_STATUS status = socket->Connect(&native_name, namelen);
    if (XFAILED(status)) {
      XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
-@@ -698,7 +1059,7 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
+@@ -698,7 +1176,7 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
  }
  
  u32 NetDll_listen_entry(u32 caller, u32 socket_handle, i32 backlog) {
@@ -1217,7 +1698,7 @@ index 58e36a4..d0b94e0 100644
    if (!socket) {
      // WSAENOTSOCK
      XThread::SetLastError(0x2736);
-@@ -722,7 +1083,7 @@ u32 NetDll_accept_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> addr
+@@ -722,7 +1200,7 @@ u32 NetDll_accept_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> addr
      return -1;
    }
  
@@ -1226,7 +1707,7 @@ index 58e36a4..d0b94e0 100644
    if (!socket) {
      // WSAENOTSOCK
      XThread::SetLastError(0x2736);
-@@ -737,7 +1098,7 @@ u32 NetDll_accept_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> addr
+@@ -737,7 +1215,7 @@ u32 NetDll_accept_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> addr
      std::memcpy(addr_ptr->sa_data, native_addr.sa_data, *addrlen_ptr - 2);
      *addrlen_ptr = native_len;
  
@@ -1235,7 +1716,7 @@ index 58e36a4..d0b94e0 100644
    } else {
      return -1;
    }
-@@ -762,7 +1123,7 @@ struct host_set {
+@@ -762,7 +1240,7 @@ struct host_set {
          break;
        }
        // Convert from Xenia -> native
@@ -1244,7 +1725,7 @@ index 58e36a4..d0b94e0 100644
        assert_not_null(socket);
        this->sockets[i] = socket;
      }
-@@ -772,7 +1133,7 @@ struct host_set {
+@@ -772,7 +1250,7 @@ struct host_set {
      guest_set->fd_count = 0;
      for (uint32_t i = 0; i < this->count; ++i) {
        auto socket = this->sockets[i];
@@ -1253,7 +1734,7 @@ index 58e36a4..d0b94e0 100644
      }
    }
  
-@@ -845,7 +1206,7 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
+@@ -845,7 +1323,7 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
  }
  
  u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags) {
@@ -1262,7 +1743,7 @@ index 58e36a4..d0b94e0 100644
    if (!socket) {
      // WSAENOTSOCK
      XThread::SetLastError(0x2736);
-@@ -857,7 +1218,7 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+@@ -857,7 +1335,7 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
  
  u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len,
                            u32 flags, ppc_ptr_t<XSOCKADDR_IN> from_ptr, mapped_u32 fromlen_ptr) {
@@ -1271,7 +1752,7 @@ index 58e36a4..d0b94e0 100644
    if (!socket) {
      // WSAENOTSOCK
      XThread::SetLastError(0x2736);
-@@ -871,6 +1232,14 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
+@@ -871,6 +1349,14 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
    uint32_t native_fromlen = fromlen_ptr ? fromlen_ptr.value() : 0;
    int ret =
        socket->RecvFrom(buf_ptr, buf_len, flags, &native_from, fromlen_ptr ? &native_fromlen : 0);
@@ -1286,7 +1767,7 @@ index 58e36a4..d0b94e0 100644
  
    if (from_ptr) {
      from_ptr->sin_family = native_from.sin_family;
-@@ -896,7 +1265,7 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
+@@ -896,7 +1382,7 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
  }
  
  u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags) {
@@ -1295,7 +1776,7 @@ index 58e36a4..d0b94e0 100644
    if (!socket) {
      // WSAENOTSOCK
      XThread::SetLastError(0x2736);
-@@ -908,15 +1277,29 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+@@ -908,15 +1394,29 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
  
  u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags,
                          ppc_ptr_t<XSOCKADDR_IN> to_ptr, u32 to_len) {
@@ -1328,7 +1809,7 @@ index 58e36a4..d0b94e0 100644
  }
  
  u32 NetDll___WSAFDIsSet_entry(u32 socket_handle, ppc_ptr_t<x_fd_set> fd_set) {
-@@ -959,6 +1342,12 @@ REX_EXPORT(__imp__NetDll_XNetXnAddrToMachineId,
+@@ -959,6 +1459,12 @@ REX_EXPORT(__imp__NetDll_XNetXnAddrToMachineId,
  REX_EXPORT(__imp__NetDll_XNetInAddrToString, rex::kernel::xam::NetDll_XNetInAddrToString_entry)
  REX_EXPORT(__imp__NetDll_XNetXnAddrToInAddr, rex::kernel::xam::NetDll_XNetXnAddrToInAddr_entry)
  REX_EXPORT(__imp__NetDll_XNetInAddrToXnAddr, rex::kernel::xam::NetDll_XNetInAddrToXnAddr_entry)
@@ -1341,7 +1822,15 @@ index 58e36a4..d0b94e0 100644
  REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
             rex::kernel::xam::NetDll_XNetSetSystemLinkPort_entry)
  REX_EXPORT(__imp__NetDll_XNetGetEthernetLinkStatus,
-@@ -1030,25 +1419,19 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
+@@ -968,6 +1474,7 @@ REX_EXPORT(__imp__NetDll_XNetDnsRelease, rex::kernel::xam::NetDll_XNetDnsRelease
+ REX_EXPORT(__imp__NetDll_XNetQosServiceLookup, rex::kernel::xam::NetDll_XNetQosServiceLookup_entry)
+ REX_EXPORT(__imp__NetDll_XNetQosRelease, rex::kernel::xam::NetDll_XNetQosRelease_entry)
+ REX_EXPORT(__imp__NetDll_XNetQosListen, rex::kernel::xam::NetDll_XNetQosListen_entry)
++REX_EXPORT(__imp__NetDll_XNetQosLookup, rex::kernel::xam::NetDll_XNetQosLookup_entry)
+ REX_EXPORT(__imp__NetDll_inet_addr, rex::kernel::xam::NetDll_inet_addr_entry)
+ REX_EXPORT(__imp__NetDll_socket, rex::kernel::xam::NetDll_socket_entry)
+ REX_EXPORT(__imp__NetDll_closesocket, rex::kernel::xam::NetDll_closesocket_entry)
+@@ -1030,25 +1537,18 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
  REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
  REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
  REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
@@ -1355,7 +1844,7 @@ index 58e36a4..d0b94e0 100644
  REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
  REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
  REX_EXPORT_STUB(__imp__NetDll_XNetQosGetListenStats);
- REX_EXPORT_STUB(__imp__NetDll_XNetQosLookup);
+-REX_EXPORT_STUB(__imp__NetDll_XNetQosLookup);
 -REX_EXPORT_STUB(__imp__NetDll_XNetRegisterKey);
  REX_EXPORT_STUB(__imp__NetDll_XNetReplaceKey);
  REX_EXPORT_STUB(__imp__NetDll_XNetServerToInAddr);
@@ -1668,14 +2157,15 @@ index 8778066..aa2621b 100644
  REX_EXPORT_STUB(__imp__XamUserFlushLogonQueue);
  REX_EXPORT_STUB(__imp__XamUserGetAge);
 diff --git a/src/system/CMakeLists.txt b/src/system/CMakeLists.txt
-index fc46d86..c905c11 100644
+index fc46d86..eb52e47 100644
 --- a/src/system/CMakeLists.txt
 +++ b/src/system/CMakeLists.txt
-@@ -17,6 +17,7 @@ set(REXSYSTEM_SOURCES
+@@ -17,6 +17,8 @@ set(REXSYSTEM_SOURCES
      xnotifylistener.cpp
      xenumerator.cpp
      xsocket.cpp
 +    xnet_address_table.cpp
++    xsession_discovery.cpp
      xsymboliclink.cpp
      xobject.cpp
      xmodule.cpp
@@ -2023,6 +2513,494 @@ index 0000000..6e4cfe6
 +}
 +
 +}  // namespace rex::system
+diff --git a/src/system/xsession_discovery.cpp b/src/system/xsession_discovery.cpp
+new file mode 100644
+index 0000000..ee58650
+--- /dev/null
++++ b/src/system/xsession_discovery.cpp
+@@ -0,0 +1,482 @@
++/**
++ * @file        system/xsession_discovery.cpp
++ * @brief       LAN / same-PC session discovery (see xsession_discovery.h)
++ */
++#include <rex/system/xsession_discovery.h>
++
++#include <algorithm>
++#include <chrono>
++#include <cstring>
++#include <random>
++#include <thread>
++
++#include <fmt/format.h>
++
++#include <rex/cvar.h>
++#include <rex/logging.h>
++#include <rex/platform.h>
++#include <rex/system/xnet_address_table.h>
++
++#if REX_PLATFORM_WIN32
++#include <winsock2.h>
++#include <ws2tcpip.h>
++#else
++#include <arpa/inet.h>
++#include <netinet/in.h>
++#include <sys/select.h>
++#include <sys/socket.h>
++#include <unistd.h>
++#endif
++
++REXCVAR_DECLARE(std::string, net_host_ip);
++
++namespace rex::system {
++
++namespace {
++
++constexpr uint8_t kMagic[4] = {'S', 'V', 'R', 'N'};
++constexpr size_t kMaxGamertag = 32;
++constexpr size_t kMaxQosData = 1024;
++constexpr size_t kMaxPacket = 1400;
++
++class Writer {
++ public:
++  void u8(uint8_t v) { bytes_.push_back(v); }
++  void u16(uint16_t v) {
++    u8(uint8_t(v >> 8));
++    u8(uint8_t(v));
++  }
++  void u32(uint32_t v) {
++    u16(uint16_t(v >> 16));
++    u16(uint16_t(v));
++  }
++  void raw(const uint8_t* p, size_t n) { bytes_.insert(bytes_.end(), p, p + n); }
++  std::vector<uint8_t> take() { return std::move(bytes_); }
++
++ private:
++  std::vector<uint8_t> bytes_;
++};
++
++class Reader {
++ public:
++  Reader(const uint8_t* p, size_t n) : p_(p), n_(n) {}
++  bool ok() const { return ok_; }
++  bool done() const { return ok_ && pos_ == n_; }
++  uint8_t u8() { return need(1) ? p_[pos_++] : 0; }
++  uint16_t u16() {
++    uint16_t hi = u8();
++    return uint16_t(hi << 8 | u8());
++  }
++  uint32_t u32() {
++    uint32_t hi = u16();
++    return hi << 16 | u16();
++  }
++  void raw(uint8_t* out, size_t n) {
++    if (need(n)) {
++      std::memcpy(out, p_ + pos_, n);
++      pos_ += n;
++    }
++  }
++
++ private:
++  bool need(size_t k) {
++    if (!ok_ || n_ - pos_ < k) {
++      ok_ = false;
++      return false;
++    }
++    return true;
++  }
++  const uint8_t* p_;
++  size_t n_;
++  size_t pos_ = 0;
++  bool ok_ = true;
++};
++
++void WriteHeader(Writer& w, DiscoveryPacket type, uint32_t title_id, uint32_t nonce) {
++  w.raw(kMagic, 4);
++  w.u8(kDiscoveryVersion);
++  w.u8(uint8_t(type));
++  w.u16(0);
++  w.u32(title_id);
++  w.u32(nonce);
++}
++
++// Returns the nonce if the header is ours, of `type`, for `title_id`.
++std::optional<uint32_t> ReadHeader(Reader& r, DiscoveryPacket type, uint32_t title_id) {
++  uint8_t magic[4];
++  r.raw(magic, 4);
++  uint8_t version = r.u8();
++  uint8_t kind = r.u8();
++  r.u16();
++  uint32_t title = r.u32();
++  uint32_t nonce = r.u32();
++  if (!r.ok() || std::memcmp(magic, kMagic, 4) != 0 || version != kDiscoveryVersion ||
++      kind != uint8_t(type) || title != title_id) {
++    return std::nullopt;
++  }
++  return nonce;
++}
++
++uint64_t NowMs() {
++  return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
++                      std::chrono::steady_clock::now().time_since_epoch())
++                      .count());
++}
++
++uint32_t RandomNonce() {
++  static std::mt19937 rng{std::random_device{}()};
++  uint32_t n;
++  do {
++    n = rng();
++  } while (n == 0);
++  return n;
++}
++
++#if REX_PLATFORM_WIN32
++using socket_t = SOCKET;
++constexpr socket_t kNoSocket = INVALID_SOCKET;
++#else
++using socket_t = int;
++constexpr socket_t kNoSocket = -1;
++#endif
++
++void SendTo(intptr_t sock, const std::vector<uint8_t>& packet, uint32_t ip, uint16_t port) {
++  sockaddr_in to = {};
++  to.sin_family = AF_INET;
++  to.sin_addr.s_addr = htonl(ip);
++  to.sin_port = htons(port);
++  sendto(socket_t(sock), reinterpret_cast<const char*>(packet.data()), int(packet.size()), 0,
++         reinterpret_cast<sockaddr*>(&to), sizeof(to));
++}
++
++}  // namespace
++
++uint64_t SessionAdvert::session_id() const {
++  uint64_t id = 0;
++  for (int i = 0; i < 8; ++i) {
++    id = id << 8 | session_info[i];
++  }
++  return id;
++}
++
++std::vector<uint8_t> EncodeQuery(uint32_t title_id, uint32_t nonce) {
++  Writer w;
++  WriteHeader(w, DiscoveryPacket::kQuery, title_id, nonce);
++  return w.take();
++}
++
++std::optional<uint32_t> DecodeQuery(const uint8_t* data, size_t size, uint32_t title_id) {
++  Reader r(data, size);
++  auto nonce = ReadHeader(r, DiscoveryPacket::kQuery, title_id);
++  return nonce && r.done() ? nonce : std::nullopt;
++}
++
++std::vector<uint8_t> EncodeAdvert(const SessionAdvert& a, uint32_t nonce) {
++  Writer w;
++  WriteHeader(w, DiscoveryPacket::kAdvert, a.title_id, nonce);
++  w.raw(a.session_info.data(), a.session_info.size());
++  w.u32(a.open_public);
++  w.u32(a.open_private);
++  w.u32(a.filled_public);
++  w.u32(a.filled_private);
++  const size_t tag = std::min(a.host_gamertag.size(), kMaxGamertag);
++  w.u8(uint8_t(tag));
++  w.raw(reinterpret_cast<const uint8_t*>(a.host_gamertag.data()), tag);
++  const size_t contexts = std::min<size_t>(a.contexts.size(), 255);
++  w.u8(uint8_t(contexts));
++  for (size_t i = 0; i < contexts; ++i) {
++    w.u32(a.contexts[i].id);
++    w.u32(a.contexts[i].value);
++  }
++  const size_t properties = std::min<size_t>(a.properties.size(), 255);
++  w.u8(uint8_t(properties));
++  for (size_t i = 0; i < properties; ++i) {
++    w.u32(a.properties[i].id);
++    w.u8(a.properties[i].type);
++    w.raw(a.properties[i].value.data(), 8);
++  }
++  const size_t qos = std::min(a.qos_data.size(), kMaxQosData);
++  w.u16(uint16_t(qos));
++  w.raw(a.qos_data.data(), qos);
++  return w.take();
++}
++
++std::optional<SessionAdvert> DecodeAdvert(const uint8_t* data, size_t size, uint32_t title_id,
++                                          uint32_t* nonce_out) {
++  Reader r(data, size);
++  auto nonce = ReadHeader(r, DiscoveryPacket::kAdvert, title_id);
++  if (!nonce) {
++    return std::nullopt;
++  }
++  SessionAdvert a;
++  a.title_id = title_id;
++  r.raw(a.session_info.data(), a.session_info.size());
++  a.open_public = r.u32();
++  a.open_private = r.u32();
++  a.filled_public = r.u32();
++  a.filled_private = r.u32();
++  const uint8_t tag = r.u8();
++  if (tag > kMaxGamertag) {
++    return std::nullopt;
++  }
++  a.host_gamertag.resize(tag);
++  r.raw(reinterpret_cast<uint8_t*>(a.host_gamertag.data()), tag);
++  a.contexts.resize(r.u8());
++  for (auto& c : a.contexts) {
++    c.id = r.u32();
++    c.value = r.u32();
++  }
++  a.properties.resize(r.u8());
++  for (auto& p : a.properties) {
++    p.id = r.u32();
++    p.type = r.u8();
++    r.raw(p.value.data(), 8);
++  }
++  const uint16_t qos = r.u16();
++  if (qos > kMaxQosData) {
++    return std::nullopt;
++  }
++  a.qos_data.resize(qos);
++  r.raw(a.qos_data.data(), qos);
++  if (!r.done()) {
++    return std::nullopt;
++  }
++  if (nonce_out) {
++    *nonce_out = *nonce;
++  }
++  return a;
++}
++
++SessionDiscovery& SessionDiscovery::Get() {
++  static SessionDiscovery instance;
++  return instance;
++}
++
++bool SessionDiscovery::Start(uint32_t title_id, int32_t port_offset) {
++  std::lock_guard lock(mutex_);
++  if (started_) {
++    return socket_ != -1;
++  }
++  started_ = true;
++  title_id_ = title_id;
++  port_offset_ = port_offset;
++#if REX_PLATFORM_WIN32
++  WSADATA wsa_data;
++  WSAStartup(MAKEWORD(2, 2), &wsa_data);
++#endif
++  socket_t sock = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++  if (sock == kNoSocket) {
++    REXSYS_ERROR("[net] discovery: can't create a UDP socket");
++    return false;
++  }
++  int on = 1;
++  setsockopt(sock, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&on), sizeof(on));
++  const uint16_t port = uint16_t(kDiscoveryBasePort + port_offset);
++  sockaddr_in local = {};
++  local.sin_family = AF_INET;
++  local.sin_addr.s_addr = htonl(INADDR_ANY);
++  local.sin_port = htons(port);
++  if (bind(sock, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) {
++    REXSYS_ERROR(
++        "[net] discovery: can't bind UDP port {} (another instance with the same "
++        "net_port?); this instance can search but not be found",
++        port);
++  } else {
++    REXSYS_INFO("[net] discovery: listening on UDP port {} (title {:08X})", port, title_id);
++  }
++  socket_ = intptr_t(sock);
++  std::thread([this] { ReceiveLoop(); }).detach();
++  return true;
++}
++
++void SessionDiscovery::SetHosted(std::optional<SessionAdvert> advert) {
++  std::lock_guard lock(mutex_);
++  if (advert) {
++    for (const auto& [id, data] : qos_data_) {
++      if (id == advert->session_id()) {
++        advert->qos_data = data;
++      }
++    }
++    REXSYS_INFO(
++        "[net] discovery: now advertising session {:016X} ({} open public, {} open "
++        "private slots, {} contexts, {} properties, {} QoS bytes)",
++        advert->session_id(), advert->open_public, advert->open_private, advert->contexts.size(),
++        advert->properties.size(), advert->qos_data.size());
++  } else if (hosted_) {
++    REXSYS_INFO("[net] discovery: stopped advertising session {:016X}", hosted_->session_id());
++  }
++  hosted_ = std::move(advert);
++}
++
++void SessionDiscovery::SetQosData(uint64_t session_id, std::vector<uint8_t> data) {
++  std::lock_guard lock(mutex_);
++  if (hosted_ && hosted_->session_id() == session_id) {
++    hosted_->qos_data = data;
++  }
++  for (auto& [id, d] : qos_data_) {
++    if (id == session_id) {
++      d = std::move(data);
++      return;
++    }
++  }
++  qos_data_.emplace_back(session_id, std::move(data));
++}
++
++std::optional<SessionAdvert> SessionDiscovery::hosted() const {
++  std::lock_guard lock(mutex_);
++  return hosted_;
++}
++
++void SessionDiscovery::ReceiveLoop() {
++  std::vector<uint8_t> buffer(kMaxPacket);
++  while (true) {
++    sockaddr_in from = {};
++    socklen_t from_len = sizeof(from);
++    const int n =
++        int(recvfrom(socket_t(socket_), reinterpret_cast<char*>(buffer.data()), int(buffer.size()),
++                     0, reinterpret_cast<sockaddr*>(&from), &from_len));
++    if (n <= 0) {
++#if REX_PLATFORM_WIN32
++      // A query to a port nobody listens on comes back as WSAECONNRESET on
++      // Windows; that's normal for a search, not a dead socket.
++      if (WSAGetLastError() == WSAECONNRESET) {
++        continue;
++      }
++#endif
++      std::this_thread::sleep_for(std::chrono::milliseconds(50));
++      continue;
++    }
++    const uint32_t from_ip = ntohl(from.sin_addr.s_addr);
++    const uint16_t from_port = ntohs(from.sin_port);
++    std::lock_guard lock(mutex_);
++    if (auto nonce = DecodeQuery(buffer.data(), size_t(n), title_id_)) {
++      if (hosted_) {
++        SendTo(socket_, EncodeAdvert(*hosted_, *nonce), from_ip, from_port);
++        REXSYS_DEBUG("[net] discovery: answered query {:08X} from {}:{}", *nonce,
++                     FormatIPv4(from_ip), from_port);
++      }
++      continue;
++    }
++    uint32_t nonce = 0;
++    if (auto advert = DecodeAdvert(buffer.data(), size_t(n), title_id_, &nonce)) {
++      if (nonce != pending_nonce_ || pending_nonce_ == 0) {
++        continue;  // a late answer to an earlier search
++      }
++      const uint64_t id = advert->session_id();
++      bool dup = std::any_of(pending_.begin(), pending_.end(),
++                             [&](const FoundSession& f) { return f.advert.session_id() == id; });
++      if (!dup) {
++        pending_.push_back(
++            {std::move(*advert), from_ip, from_port, uint32_t(NowMs() - pending_sent_ms_)});
++      }
++      continue;
++    }
++    REXSYS_DEBUG(
++        "[net] discovery: ignored {} bytes from {}:{} (not ours, other version or "
++        "other title)",
++        n, FormatIPv4(from_ip), from_port);
++  }
++}
++
++std::vector<FoundSession> SessionDiscovery::Collect(
++    const std::vector<std::pair<uint32_t, uint16_t>>& targets, uint32_t timeout_ms,
++    std::optional<uint64_t> want) {
++  uint32_t nonce = RandomNonce();
++  std::optional<uint64_t> own;
++  {
++    std::lock_guard lock(mutex_);
++    if (socket_ == -1) {
++      return {};
++    }
++    pending_nonce_ = nonce;
++    pending_sent_ms_ = NowMs();
++    pending_.clear();
++    if (hosted_) {
++      own = hosted_->session_id();
++    }
++  }
++  const auto query = EncodeQuery(title_id_, nonce);
++  for (const auto& [ip, port] : targets) {
++    SendTo(socket_, query, ip, port);
++  }
++  const uint64_t deadline = NowMs() + timeout_ms;
++  std::vector<FoundSession> found;
++  while (NowMs() < deadline) {
++    std::this_thread::sleep_for(std::chrono::milliseconds(20));
++    std::lock_guard lock(mutex_);
++    if (want && std::any_of(pending_.begin(), pending_.end(), [&](const FoundSession& f) {
++          return f.advert.session_id() == *want;
++        })) {
++      break;
++    }
++  }
++  std::lock_guard lock(mutex_);
++  for (auto& f : pending_) {
++    if (own && f.advert.session_id() == *own) {
++      continue;
++    }
++    if (want && f.advert.session_id() != *want) {
++      continue;
++    }
++    seen_.erase(std::remove_if(seen_.begin(), seen_.end(),
++                               [&](const FoundSession& s) {
++                                 return s.advert.session_id() == f.advert.session_id();
++                               }),
++                seen_.end());
++    seen_.push_back(f);
++    found.push_back(f);
++  }
++  pending_nonce_ = 0;
++  pending_.clear();
++  return found;
++}
++
++std::vector<FoundSession> SessionDiscovery::Search(uint32_t timeout_ms) {
++  std::vector<std::pair<uint32_t, uint16_t>> targets;
++  std::vector<uint32_t> ips = {INADDR_BROADCAST, INADDR_LOOPBACK};
++  const std::string host = REXCVAR_GET(net_host_ip);
++  if (!host.empty()) {
++    in_addr addr = {};
++    if (inet_pton(AF_INET, host.c_str(), &addr) == 1) {
++      ips.push_back(ntohl(addr.s_addr));
++    } else {
++      REXSYS_WARN("[net] discovery: net_host_ip '{}' is not an IPv4 address", host);
++    }
++  }
++  for (uint32_t ip : ips) {
++    for (int32_t i = 0; i < kDiscoveryPorts; ++i) {
++      targets.emplace_back(ip, uint16_t(kDiscoveryBasePort + i));
++    }
++  }
++  auto found = Collect(targets, timeout_ms, std::nullopt);
++  REXSYS_INFO("[net] discovery: search found {} session(s){}", found.size(),
++              host.empty() ? "" : fmt::format(" (also asked {})", host));
++  for (const auto& f : found) {
++    REXSYS_INFO(
++        "[net] discovery:   {:016X} hosted by '{}' at {}:{}, {} ms, {}/{} public slots open",
++        f.advert.session_id(), f.advert.host_gamertag, FormatIPv4(f.from_ip), f.from_port, f.rtt_ms,
++        f.advert.open_public, f.advert.open_public + f.advert.filled_public);
++  }
++  return found;
++}
++
++std::optional<FoundSession> SessionDiscovery::Find(uint64_t session_id) const {
++  std::lock_guard lock(mutex_);
++  for (const auto& f : seen_) {
++    if (f.advert.session_id() == session_id) {
++      return f;
++    }
++  }
++  return std::nullopt;
++}
++
++std::optional<FoundSession> SessionDiscovery::Probe(uint32_t ip, int32_t port_offset,
++                                                    uint64_t session_id, uint32_t timeout_ms) {
++  auto found = Collect({{ip, uint16_t(kDiscoveryBasePort + port_offset)}}, timeout_ms, session_id);
++  if (found.empty()) {
++    return std::nullopt;
++  }
++  return found.front();
++}
++
++}  // namespace rex::system
 diff --git a/src/system/xsocket.cpp b/src/system/xsocket.cpp
 index 2d13ac8..fd90432 100644
 --- a/src/system/xsocket.cpp
@@ -2094,19 +3072,20 @@ index 7199826..184b667 100644
      REXLOG_DEBUG("Loaded config: {}", config_path_.filename().string());
  
 diff --git a/tests/unit/CMakeLists.txt b/tests/unit/CMakeLists.txt
-index 7bd264b..ded9b99 100644
+index 7bd264b..349d9ab 100644
 --- a/tests/unit/CMakeLists.txt
 +++ b/tests/unit/CMakeLists.txt
-@@ -4,6 +4,8 @@ add_executable(unit_tests
+@@ -4,6 +4,9 @@ add_executable(unit_tests
      test_memory.cpp
      memory/heap_allocation_test.cpp
      kernel/object_table_test.cpp
 +    system/xnet_address_table_test.cpp
++    system/xsession_discovery_test.cpp
 +    system/profile_slot_test.cpp
      core/cvar_test.cpp
      core/fiber_test.cpp
      core/filesystem_test.cpp
-@@ -36,6 +38,8 @@ target_link_libraries(unit_tests PRIVATE
+@@ -36,6 +39,8 @@ target_link_libraries(unit_tests PRIVATE
      rexcodegen
      rexruntime
      Catch2::Catch2WithMain
@@ -2317,4 +3296,96 @@ index 0000000..b8f5393
 +  // B receives from A's real bind port and sees A's virtual address.
 +  XNetEndpoint seen = b.FromWire({kLanA, a.HostBindPort(kGamePort)}, kGamePort);
 +  CHECK(seen == XNetEndpoint{a_as_seen_by_b, kGamePort});
++}
+diff --git a/tests/unit/system/xsession_discovery_test.cpp b/tests/unit/system/xsession_discovery_test.cpp
+new file mode 100644
+index 0000000..0f33542
+--- /dev/null
++++ b/tests/unit/system/xsession_discovery_test.cpp
+@@ -0,0 +1,86 @@
++/**
++ * @file        tests/unit/system/xsession_discovery_test.cpp
++ * @brief       Session discovery wire format
++ */
++#include <catch2/catch_test_macros.hpp>
++
++#include <rex/system/xsession_discovery.h>
++
++using namespace rex::system;
++
++namespace {
++
++constexpr uint32_t kTitle = 0x545107E0;
++
++SessionAdvert SampleAdvert() {
++  SessionAdvert a;
++  a.title_id = kTitle;
++  for (size_t i = 0; i < a.session_info.size(); ++i) {
++    a.session_info[i] = uint8_t(0x80 + i);
++  }
++  a.open_public = 1;
++  a.open_private = 0;
++  a.filled_public = 1;
++  a.filled_private = 0;
++  a.host_gamertag = "Superstar1393";
++  a.contexts = {{0x00008001, 1}, {0x00000003, 2}};
++  a.properties = {{0x10000001, 1, {0, 0, 0, 0, 0, 0, 0, 7}}};
++  a.qos_data = {1, 2, 3, 4, 5};
++  return a;
++}
++
++}  // namespace
++
++TEST_CASE("Query round-trips its nonce", "[discovery]") {
++  auto q = EncodeQuery(kTitle, 0xCAFEF00D);
++  auto nonce = DecodeQuery(q.data(), q.size(), kTitle);
++  REQUIRE(nonce);
++  CHECK(*nonce == 0xCAFEF00D);
++}
++
++TEST_CASE("Query for another title is ignored", "[discovery]") {
++  auto q = EncodeQuery(kTitle, 1);
++  CHECK_FALSE(DecodeQuery(q.data(), q.size(), kTitle + 1));
++}
++
++TEST_CASE("Advert round-trips everything the title sees", "[discovery]") {
++  auto a = SampleAdvert();
++  auto bytes = EncodeAdvert(a, 42);
++  uint32_t nonce = 0;
++  auto b = DecodeAdvert(bytes.data(), bytes.size(), kTitle, &nonce);
++  REQUIRE(b);
++  CHECK(*b == a);
++  CHECK(nonce == 42);
++  CHECK(b->session_id() == 0x8081828384858687ull);
++}
++
++TEST_CASE("Advert is not mistaken for a query and vice versa", "[discovery]") {
++  auto a = EncodeAdvert(SampleAdvert(), 1);
++  CHECK_FALSE(DecodeQuery(a.data(), a.size(), kTitle));
++  auto q = EncodeQuery(kTitle, 1);
++  CHECK_FALSE(DecodeAdvert(q.data(), q.size(), kTitle));
++}
++
++TEST_CASE("Truncated or padded adverts are rejected", "[discovery]") {
++  auto bytes = EncodeAdvert(SampleAdvert(), 1);
++  for (size_t cut = 0; cut < bytes.size(); ++cut) {
++    CHECK_FALSE(DecodeAdvert(bytes.data(), cut, kTitle));
++  }
++  bytes.push_back(0);
++  CHECK_FALSE(DecodeAdvert(bytes.data(), bytes.size(), kTitle));
++}
++
++TEST_CASE("Other protocol versions are ignored", "[discovery]") {
++  auto bytes = EncodeAdvert(SampleAdvert(), 1);
++  bytes[4] = kDiscoveryVersion + 1;
++  CHECK_FALSE(DecodeAdvert(bytes.data(), bytes.size(), kTitle));
++}
++
++TEST_CASE("An empty advert still fits", "[discovery]") {
++  SessionAdvert a;
++  a.title_id = kTitle;
++  auto bytes = EncodeAdvert(a, 7);
++  auto b = DecodeAdvert(bytes.data(), bytes.size(), kTitle);
++  REQUIRE(b);
++  CHECK(*b == a);
 +}
