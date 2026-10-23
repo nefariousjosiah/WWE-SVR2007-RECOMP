@@ -22,6 +22,9 @@ $Log = "$Root\logs\game.log"
 $Host.UI.RawUI.WindowTitle = "WWE SVR 2008 - log"
 New-Item -ItemType Directory -Force "$Root\logs" | Out-Null
 if (Test-Path $Log) { Move-Item $Log "$Root\logs\game.prev.log" -Force }
+# Shaders (dump build: all of them; native build: those missing from its cache) go where
+# tools\native\build_shader_cache.ps1 reads them, not next to the exe in out\build.
+if (-not $env:SVR_DUMP_SHADERS) { $env:SVR_DUMP_SHADERS = "$Root\logs\shaders" }
 
 # Extra args override these defaults. The game's parser rejects a setting given twice (and then
 # ignores the whole command line), so a default is only added when the caller didn't pass it.
