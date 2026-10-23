@@ -415,7 +415,7 @@ index 0000000..5c169b4
 +
 +}  // namespace rex::system
 diff --git a/src/kernel/xam/apps/xgi_app.cpp b/src/kernel/xam/apps/xgi_app.cpp
-index 2b222da..7d53424 100644
+index 2b222da..95c0590 100644
 --- a/src/kernel/xam/apps/xgi_app.cpp
 +++ b/src/kernel/xam/apps/xgi_app.cpp
 @@ -9,10 +9,24 @@
@@ -443,7 +443,7 @@ index 2b222da..7d53424 100644
  namespace rex {
  namespace kernel {
  namespace xam {
-@@ -23,6 +37,275 @@ using namespace rex::system;
+@@ -23,6 +37,285 @@ using namespace rex::system;
  
  XgiApp::XgiApp(KernelState* kernel_state) : App(kernel_state, 0xFB) {}
  
@@ -522,6 +522,12 @@ index 2b222da..7d53424 100644
 +  if (!advert) {
 +    return;
 +  }
++  // A session with no private slots can't take a private join: whatever the flag says (titles pass
++  // a BOOL array whose width we can't be sure of), the player takes a public slot. This is how the
++  // host's own join shows up as a filled slot, as Xbox LIVE reports it.
++  if (private_slot && advert->open_private == 0 && advert->filled_private == 0) {
++    private_slot = false;
++  }
 +  auto& open = private_slot ? advert->open_private : advert->open_public;
 +  auto& filled = private_slot ? advert->filled_private : advert->filled_public;
 +  if (delta > 0 && open > 0) {
@@ -530,6 +536,10 @@ index 2b222da..7d53424 100644
 +  } else if (delta < 0 && filled > 0) {
 +    ++open;
 +    --filled;
++  } else {
++    REXKRNL_WARN("[net] hosted session: {} {} slot change ignored ({} open, {} filled)",
++                 delta > 0 ? "join into" : "leave from", private_slot ? "private" : "public", open,
++                 filled);
 +  }
 +  discovery.SetHosted(std::move(advert));
 +}
@@ -719,7 +729,7 @@ index 2b222da..7d53424 100644
  // http://mb.mirage.org/bugzilla/xliveless/main.c
  
  X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
-@@ -42,6 +325,16 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -42,6 +335,16 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        uint32_t context_value = memory::load_and_swap<uint32_t>(buffer + 20);
        REXKRNL_DEBUG("XGIUserSetContextEx({:08X}, {:08X}, {:08X})", user_index, context_id,
                      context_value);
@@ -736,7 +746,7 @@ index 2b222da..7d53424 100644
        return X_E_SUCCESS;
      }
      case 0x000B0007: {
-@@ -51,6 +344,25 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -51,6 +354,25 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        uint32_t value_ptr = memory::load_and_swap<uint32_t>(buffer + 24);
        REXKRNL_DEBUG("XGIUserSetPropertyEx({:08X}, {:08X}, {}, {:08X})", user_index, property_id,
                      value_size, value_ptr);
@@ -762,7 +772,7 @@ index 2b222da..7d53424 100644
        return X_E_SUCCESS;
      }
      case 0x000B0008: {
-@@ -113,6 +425,30 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -113,6 +435,30 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
            "{:08X})",
            session_ptr, flags, num_slots_public, num_slots_private, user_xuid, session_info_ptr,
            nonce_ptr);
@@ -793,7 +803,7 @@ index 2b222da..7d53424 100644
        return X_E_SUCCESS;
      }
      case 0x000B0011: {
-@@ -123,6 +459,10 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -123,6 +469,10 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        uint64_t session_nonce = memory::load_and_swap<uint64_t>(buffer + 8);
  
        REXKRNL_DEBUG("XGISessionDelete({:08X}, {:08X}, {:016X})", obj_ptr, flags, session_nonce);
@@ -804,20 +814,22 @@ index 2b222da..7d53424 100644
  
        return X_E_SUCCESS;
      }
-@@ -138,6 +478,12 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -138,6 +488,14 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        REXKRNL_DEBUG("{}({:08X}, {}, {}, {:08X}, {:08X})",
                      is_local ? "XGISessionJoinLocal" : "XGISessionJoinRemote", session_ptr,
                      user_count, xuid_array_ptr, user_index_array, private_slots_array);
 +      for (uint32_t i = 0; i < user_count && i < 4; ++i) {
-+        bool private_slot = private_slots_array && memory::load_and_swap<uint32_t>(
-+                                                       memory_->TranslateVirtual(
-+                                                           private_slots_array + i * 4)) != 0;
-+        AdjustHostedSlots(session_ptr, +1, private_slot);
++        uint32_t flag = private_slots_array ? memory::load_and_swap<uint32_t>(
++                                                  memory_->TranslateVirtual(private_slots_array +
++                                                                            i * 4))
++                                            : 0;
++        REXKRNL_DEBUG("[net] join user {}: private-slot flag {:08X}", i, flag);
++        AdjustHostedSlots(session_ptr, +1, flag != 0);
 +      }
        return X_E_SUCCESS;
      }
      case 0x000B0014: {
-@@ -179,7 +525,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -179,7 +537,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        REXKRNL_DEBUG("XSessionSearch({}, {}, {}, {}, {}, {:08X}, {:08X}, {}, {:08X})", proc_index,
                      user_index, num_results, num_props, num_ctx, props_ptr, ctx_ptr,
                      results_buffer_size, search_results_ptr);
@@ -826,7 +838,7 @@ index 2b222da..7d53424 100644
      }
      case 0x000B0018: {
        assert_true(!buffer_length || buffer_length == 16);
-@@ -194,28 +540,6 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -194,28 +552,6 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
  
        return X_E_SUCCESS;
      }
@@ -855,13 +867,19 @@ index 2b222da..7d53424 100644
      case 0x000B001D: {
        assert_true(!buffer_length || buffer_length == 24);
  
-@@ -445,6 +769,15 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -445,6 +781,21 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        REXKRNL_DEBUG("XGI 0x000B0071, unimplemented");
        return X_E_SUCCESS;
      }
 +    case 0x000B0013: {
-+      // XSessionLeaveLocal / LeaveRemote: nothing to tear down yet.
-+      REXKRNL_DEBUG("[net] XSessionLeave (buf {:08X}, len {}) -> ok", buffer_ptr, buffer_length);
++      // XSessionLeaveLocal / LeaveRemote: same layout as the joins (session, user count, ...).
++      uint32_t session_ptr = buffer_length >= 8 ? memory::load_and_swap<uint32_t>(buffer + 0) : 0;
++      uint32_t user_count = buffer_length >= 8 ? memory::load_and_swap<uint32_t>(buffer + 4) : 0;
++      REXKRNL_DEBUG("[net] XSessionLeave(session {:08X}, {} user(s), buf len {}) -> ok", session_ptr,
++                    user_count, buffer_length);
++      for (uint32_t i = 0; i < user_count && i < 4; ++i) {
++        AdjustHostedSlots(session_ptr, -1, false);
++      }
 +      return X_E_SUCCESS;
 +    }
 +    case 0x000B001C: {
