@@ -43,3 +43,31 @@ REX_HOOK_RAW(sub_821B5960) {
               before, after, manager, Load(base, manager ? manager + 192 : 0), link,
               Load(base, link ? link + 32 : 0), Load(base, manager ? manager + 176 : 0));
 }
+
+// The "find a match" search task (sub_8240A438, called each frame; state at +60, result code at
+// +12, 1 = still fine, 2/6/7 = failed, results buffer pointer at +864). State 2 asks for the
+// buffer size (expects 122), 3 sends XSessionSearchEx and expects 997 (pending), 4 waits for it,
+// 5 is done. Logged on each state change: whether it failed, and what the buffer holds
+// (XSESSION_SEARCHRESULT_HEADER: count, pointer to the results).
+REX_EXTERN(__imp__sub_8240A438);
+REX_HOOK_RAW(sub_8240A438) {
+  static uint32_t last_task = 0;
+  static uint32_t last_state = ~0u;
+  static uint32_t last_status = ~0u;
+  const uint32_t task = ctx.r3.u32;
+  const uint32_t before = Load(base, task + 60);
+  __imp__sub_8240A438(ctx, base);
+  const uint32_t returned = ctx.r3.u32;
+  const uint32_t after = Load(base, task + 60);
+  const uint32_t status = Load(base, task + 12);
+  if (task == last_task && after == last_state && status == last_status)
+    return;
+  last_task = task;
+  last_state = after;
+  last_status = status;
+  const uint32_t buffer = Load(base, task + 864);
+  REXLOG_INFO("[online] search task {:08X}: state {} -> {} (returned {}, status {}); results "
+              "buffer {:08X}: {} result(s), array at {:08X}",
+              task, before, after, returned, status, buffer, Load(base, buffer),
+              Load(base, buffer ? buffer + 4 : 0));
+}
