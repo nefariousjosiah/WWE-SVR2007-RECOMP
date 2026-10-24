@@ -214,6 +214,30 @@ scripts, `docs/` the images on this page.
 
 </details>
 
+<details>
+<summary><b>Netplay (work in progress)</b></summary>
+
+Online play isn't available in the releases yet. This branch is the groundwork for it: the game's
+Xbox LIVE code (DemonWare under Yuke's gss layer) runs on the ReXGlue runtime's XNet and XSession
+calls, so the port has to answer them itself.
+
+- **The SDK side** is `patches/rexglue-sdk-netplay.patch`, applied by `setup.ps1` after
+  `rexglue-sdk.patch`. It adds session discovery, search and QoS over UDP, a table of peer
+  addresses (XNADDR) and per-player profile slots. Its unit tests are under `tests/unit/` in the SDK.
+- **The game side** is `src/online_probe.cpp`, which logs the game's own online messages
+  (`[dw]`, `[gss]`) and the state changes of its Xbox LIVE menu.
+- **Testing on one PC:** `tools\windows\netplay_local.ps1` starts two instances (A and B) that
+  search for and join each other's sessions; `tools\windows\netplay_three.ps1` starts three. Each
+  instance has its own gamertag, UDP port (3074, 3075, 3076), saves (`userdata`, `userdata_b`,
+  `userdata_c`) and log (`logs\net_a.log`, `net_b.log`, `net_c.log`), and the script summarizes how
+  far each got when they exit. By default B is driven by the keyboard so one controller doesn't
+  drive both; only the focused window receives input.
+- **Status:** experimental. It has only been tried with instances on the same PC; a full match, or
+  play between two machines, isn't confirmed. Logs and reports are welcome in the
+  [issues](https://github.com/nefariousjosiah/WWE-SVR2007-RECOMP/issues).
+
+</details>
+
 ## Credits
 
 - [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) by Tom Clay, derived from
