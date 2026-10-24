@@ -11,11 +11,17 @@
 #include "gpu/device.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <memory>
 #include <mutex>
+#include <unordered_set>
 #include <vector>
 
 #include <plume_render_interface.h>
+#include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/hash.h>
 #include <zstd.h>
 
@@ -34,9 +40,50 @@
 #include <smolv.h>
 #endif
 
+REXCVAR_DEFINE_BOOL(svr_save_missing_shaders, true, "Game",
+                    "Save shaders missing from the native renderer's cache to logs/shaders "
+                    "(SVR_DUMP_SHADERS overrides the folder), for the next "
+                    "tools/native/build_shader_cache.ps1");
+
 namespace bd::gpu {
 
 namespace {
+// A shader missing from the cache is saved exactly as the shader-dump build
+// (src/dev/shader_dump.cpp) saves it: the whole container, named by its FNV-1a
+// hash, .vs/.ps. build_shader_cache.ps1 then picks it up with the rest.
+void SaveMissingShader(const u8 *container, u32 size, ResourceType type) {
+  if (!REXCVAR_GET(svr_save_missing_shaders) || size == 0 || size > 0x200000)
+    return;
+  static std::mutex mutex;
+  static std::unordered_set<u64> saved;
+  u64 fnv = 0xCBF29CE484222325ull;
+  for (u32 i = 0; i < size; ++i)
+    fnv = (fnv ^ container[i]) * 0x100000001B3ull;
+  std::lock_guard lock(mutex);
+  if (!saved.insert(fnv).second)
+    return;
+  const char *env = std::getenv("SVR_DUMP_SHADERS");
+  const std::filesystem::path dir =
+      env && *env ? std::filesystem::path(env)
+                  : rex::filesystem::GetExecutableFolder() / "logs" / "shaders";
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+  char name[64];
+  std::snprintf(name, sizeof(name), "%016llX.%s", (unsigned long long)fnv,
+                type == ResourceType::PixelShader ? "ps" : "vs");
+  const auto path = dir / name;
+  if (std::filesystem::exists(path))
+    return; // saved by an earlier session, still waiting for a cache rebuild
+  if (FILE *f = std::fopen(path.string().c_str(), "wb")) {
+    std::fwrite(container, 1, size, f);
+    std::fclose(f);
+    BD_INFO("[shaders] saved missing shader {} ({} bytes) to {}", name, size,
+            dir.string());
+  } else {
+    BD_WARN("[shaders] couldn't save missing shader to {}", path.string());
+  }
+}
+
 ShaderCacheEntry *FindShaderCacheEntry(u64 hash) {
   auto *end = g_shaderCacheEntries + g_shaderCacheEntryCount;
   auto *result = std::lower_bound(
@@ -168,6 +215,7 @@ GuestShader *CreateShader(const be_u32 *function, ResourceType type) {
   } else {
     BD_WARN("Shader cache miss: hash=0x{:016X} len={} type={}", hash, hash_len,
             static_cast<u32>(type));
+    SaveMissingShader(reinterpret_cast<const u8 *>(function), hash_len, type);
   }
   // Let boot cache replay enqueue any pending PSO that was waiting on this
   // shader's microcode hash now that its host object exists.

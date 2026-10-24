@@ -36,8 +36,8 @@ function Refresh-Path {
   $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
               [Environment]::GetEnvironmentVariable("Path", "User")
 }
-# Clone a repository at a commit with its submodules, then apply our patch to it.
-function Fetch($url, $dir, $commit, $patch) {
+# Clone a repository at a commit with its submodules, then apply our patches to it, in order.
+function Fetch($url, $dir, $commit, [string[]]$patches) {
   if (Test-Path "$dir\CMakeLists.txt") { return }
   Step "Fetching $url ($commit)"
   New-Item -ItemType Directory -Force (Split-Path $dir) | Out-Null
@@ -47,7 +47,7 @@ function Fetch($url, $dir, $commit, $patch) {
   Run git @("-C", $dir, "checkout", $commit)
   Run git @("-c", "core.longpaths=true", "-C", $dir, "submodule", "update", "--init", "--recursive",
             "--depth", "1", "--jobs", "8")
-  if ($patch) { Run git @("-C", $dir, "apply", $patch) }
+  foreach ($patch in $patches) { Run git @("-C", $dir, "apply", $patch) }
 }
 
 # --- 1. Tools ------------------------------------------------------------------
@@ -76,7 +76,10 @@ if (-not $SkipInstall) {
 Set-Location $Root
 
 # --- 2. Third-party sources ----------------------------------------------------
-Fetch "https://github.com/rexglue/rexglue-sdk.git" "$Root\third_party\rexglue-sdk" $SdkCommit "$Root\patches\rexglue-sdk.patch"
+Fetch "https://github.com/rexglue/rexglue-sdk.git" "$Root\third_party\rexglue-sdk" $SdkCommit @(
+  "$Root\patches\rexglue-sdk.patch",
+  # Online play (XNet/XSession emulation for recomp-to-recomp matches), on top of the above.
+  "$Root\patches\rexglue-sdk-netplay.patch")
 Fetch "https://github.com/zolaware/plume.git" "$Root\third_party\plume" $PlumeCommit "$Root\patches\plume.patch"
 Fetch "https://github.com/zolaware/reblue-XenosRecomp.git" "$Root\third_party\XenosRecomp" $XenosCommit "$Root\patches\xenosrecomp.patch"
 
