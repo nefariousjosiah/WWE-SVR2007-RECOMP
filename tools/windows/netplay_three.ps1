@@ -8,21 +8,16 @@
 # Each instance has its own XUID and gamertag, so none of them matches another as "ourselves".
 # Each answers session searches on UDP 3070 + its offset (3070, 3071, 3072).
 #
-# Input: A reads the controllers (-AInput controller, the default). B and C are keyboard-only
-# (input_backend=none, mnk_mode=true) so they don't take A's pads. The keyboard driver acts only
-# on the focused window, so B and C can't both play from one keyboard. Use -BInput/-CInput
-# "controller" to give them pads too; with -BackgroundPads, every window also reads the pads
-# while unfocused. Every instance sees every connected pad, so this script doesn't pick a pad per
-# instance; see the notes at the bottom of the printed summary.
+# Input: all three read controllers by default (-AInput/-BInput/-CInput "keyboard" switches one
+# to keyboard: input_backend=none, mnk_mode=true). As in netplay_local.ps1, no instance reads pads
+# while unfocused, so only the focused window gets pad input. Every instance sees every connected
+# pad, so this script doesn't pick a pad per instance.
 param(
   [int]$Seconds = 0,
   [string]$Exe = "",
   [ValidateSet("keyboard", "controller")][string]$AInput = "controller",
   [ValidateSet("keyboard", "controller")][string]$BInput = "controller",
   [ValidateSet("keyboard", "controller")][string]$CInput = "controller",
-  # SDL reads the pads of unfocused windows too (SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS). On by default
-  # when any instance reads a pad: without it only the focused window gets pad input.
-  [switch]$NoBackgroundPads,
   [string]$Level = "trace"  # trace: every packet (sendto/recvfrom) is logged
 )
 $ErrorActionPreference = "Stop"
@@ -33,8 +28,6 @@ New-Item -ItemType Directory -Force "$Root\logs" | Out-Null
 if (-not $env:SVR_DUMP_SHADERS) { $env:SVR_DUMP_SHADERS = "$Root\logs\shaders" }
 # See netplay_local.ps1: name the API of the exe being run, so "auto" doesn't start a second copy.
 $Api = if ($Exe -match 'd3d12') { "d3d12" } else { "vulkan" }
-$AnyPads = ($BInput -eq "controller") -or ($CInput -eq "controller") -or ($AInput -eq "controller")
-if ($AnyPads -and -not $NoBackgroundPads) { $env:SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS = "1" } else { Remove-Item Env:SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS -ErrorAction SilentlyContinue }
 
 function Start-Instance($tag, [string[]]$extra) {
   $log = "$Root\logs\net_$tag.log"
