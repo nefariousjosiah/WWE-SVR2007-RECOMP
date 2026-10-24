@@ -5,6 +5,7 @@
 *.7z
 /generated/
 /userdata/
+/userdata_b/
 *-game.txt
 
 # Build output and local working folders.
