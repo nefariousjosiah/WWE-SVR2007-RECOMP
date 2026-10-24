@@ -6,6 +6,7 @@
 /generated/
 /userdata/
 /userdata_b/
+/userdata_c/
 *-game.txt
 
 # Build output and local working folders.
