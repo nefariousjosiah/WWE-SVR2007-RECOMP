@@ -305,6 +305,14 @@ GuestTexture *SvrResolveTarget(u32 texture_va) {
 // result is read back into guest memory, which stalls for the GPU; a texture resolved again and
 // again (shadows, the screen, effects redrawn every few frames) is skipped once seen in several
 // frames running, so the wait happens for one-off captures and while loading, not during play.
+//
+// A copy of the screen or a 16:9 fraction of it (1280x720 down to 160x90) is skipped too: those are
+// the game's screen effects (the start of an entrance, the camera cut before a finisher, the blur
+// levels behind the glow), which only the GPU reads. They are copied at the internal resolution, so
+// at 8K each one waited over 100 ms for the GPU: the picture froze while the music played on, so
+// entrances ran a second behind their music (GitHub issue #8), and the blur levels, redrawn every
+// second or so (too rarely to count as every frame), held matches at 48 fps. What the CPU does read
+// is another shape, like the superstar photo (384x360).
 void SvrWriteBackResolve(u32 texture_va, GuestTexture *dst) {
   struct Seen {
     u32 desc = 0;
@@ -320,6 +328,9 @@ void SvrWriteBackResolve(u32 texture_va, GuestTexture *dst) {
   if (!dst || !ReadFetch(texture_va, fetch) ||
       (fetch.format != rex::graphics::xenos::TextureFormat::k_8_8_8_8 &&
        fetch.format != rex::graphics::xenos::TextureFormat::k_8_8_8_8_A))
+    return;
+  const u32 width = fetch.size_2d.width + 1, height = fetch.size_2d.height + 1;
+  if (width <= 1280 && width * 9 == height * 16 && 1280 % width == 0)
     return;
   const u64 frame = SvrFrameIndex();
   Seen &s = seen[texture_va];
