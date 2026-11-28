@@ -1,7 +1,7 @@
 # WWE SmackDown vs. Raw 2007 — native PC, Linux & Steam Deck
 
 The Xbox 360 version of **WWE SmackDown vs. Raw 2007**, recompiled to run natively on Windows, Linux
-and the Steam Deck: no emulator, **60 fps**, up to **4K**.
+and the Steam Deck: no emulator, **60 fps**, up to **8K**.
 
 **The goal is simple: bring the game back so people can play it again, natively on PC at 60 fps.**
 It's the same game you remember, with no mods, roster changes or reworked gameplay: only what it needs
@@ -11,7 +11,7 @@ to run well on today's hardware.
 > disc. None of the disc's files are in this project or its downloads, and it does not condone
 > piracy: please buy the game.
 >
-> **Version 1.0, still updated.** Run into a problem?
+> **Version 3.0, still updated.** Run into a problem?
 > [Open an issue](https://github.com/nefariousjosiah/WWE-SVR2007-RECOMP/issues) with `game.log` from
 > the game's folder, your graphics card and a screenshot.
 
@@ -36,8 +36,10 @@ to run well on today's hardware.
 - **60 fps, entrances and matches included:** the game normally drops to 30 for them; here it stays
   in its own 60 fps mode, so everything plays at the right speed. Cutscene subtitles stay in sync.
 - **480p up to 8K:** Auto picks 1440p on 1080p and 1440p screens, 4K on 4K screens and 720p on the
-  Steam Deck; 480p helps weak graphics cards. The console's background blur (depth of field) is off
-  for a sharp image; it's a setting.
+  Steam Deck and built-in laptop graphics; 480p helps weak graphics cards. The console's background
+  blur (depth of field) is off for a sharp image; it's a setting.
+- **Widescreen (experimental):** 16:10, 21:9 and 32:9 screen shapes fill the whole screen, menus
+  included, with nothing stretched.
 - **Made for the Steam Deck:** 60 fps in entrances and matches; the arena screens' videos are decoded
   on their own thread so the busiest entrances stay smooth.
 - **Faster loading:** loading screens move quicker (the console paced its loading to the screen).
@@ -46,8 +48,18 @@ to run well on today's hardware.
 - **Saves just work:** no more "storage device has been removed".
 - **Play in English or Italiano:** the disc has the game's text in Italian too, but the game only
   ever showed English.
+- **Unlock everything if you like:** every superstar, arena, attire, move and other Shop item, as if
+  bought in the Shop.
 - **Updates from inside the game,** only when you choose to; your saves are kept and backed up.
 - **Controllers:** Xbox, PlayStation, Switch Pro and the Steam Deck's own.
+- **Keyboard and mouse:** pick your own keys in the game, two for each button (mouse buttons too),
+  and play with the mouse as the right stick if you like: **F1** > **Controls**.
+- **Button prompts that match what you play with:** PlayStation buttons (the port's own PS3-style
+  drawings) for a DualShock or DualSense, your own keys for the keyboard and mouse, Xbox buttons
+  otherwise: in the menus, loading tips and match prompts (finishers, reversals and the rest).
+  They switch as soon as you pick up the other one, or you can choose them in **Controls**.
+- **Skip the intros if you like:** they play as on the console by default; **Intros** > **Skip to
+  title screen** starts the game at Press START.
 
 <p align="center">
   <img src="docs/settings-menu.png" width="420" alt="The in-game settings menu (F1, or Back + Start on a controller)">
@@ -75,9 +87,11 @@ ID `31981C72`, about 7.8 GB).
 <details>
 <summary><b>Settings, controllers and keyboard</b></summary>
 
-- **The settings menu:** resolution (Auto, 480p, 720p, 1080p, 1440p, 4K, 8K), graphics API (Auto, Direct3D 12,
-  Vulkan), fullscreen or window, 60 or 30 fps, **Screen shape**, **Background blur**, FPS counter, sound, **Language**,
-  **Unlock everything**, keyboard controls, **Controllers**, CPU priority and updates. Saved in `svr2007.toml`.
+- **The settings menu:** resolution (Auto, 480p, 720p, 1080p, 1440p, 4K, 8K), graphics API (Auto,
+  Direct3D 12, Vulkan), fullscreen or window, 60 or 30 fps, **Screen shape**, **Background blur**,
+  FPS counter, sound, **Language**, **Unlock everything**, **Intros**, **Controls** (button
+  prompts, keyboard, controllers, keys and mouse), CPU priority and updates. Saved in
+  `svr2007.toml`.
 - **Language:** the game's text and menus in English or Italiano (the commentary is English only;
   the SvR 2007 disc has no other translations). Pick one and press A twice to restart straight into
   it.
@@ -89,14 +103,24 @@ ID `31981C72`, about 7.8 GB).
 - **Screen shape (experimental):** 16:10 (Steam Deck, many laptops), 21:9 and 32:9 (ultrawide).
   The whole game fills the screen: matches, entrances and cutscenes show more of the arena, nothing
   stretched; menu backgrounds reach the edges while text and panels keep their shape.
+- **Controls:** **Button prompts** (Auto shows the buttons of what you played with last; or always
+  Xbox, PlayStation or Keyboard), **Keyboard controls** (On or Off), **Controllers** (Separate
+  players or All on player 1) and **Keyboard & mouse setup**.
+- **Intros:** **On (original)** by default; **Skip to title screen** skips the legal screen's wait
+  and the logo and opening movies, and starts at Press START. Applies the next time you start the
+  game.
 - **Controllers:** plug yours in before starting; each controller is its own player. Playing alone
   and the game says player 2 is disconnected, or your controller stops responding? A controller that
   reconnects, or shows up twice through Steam Input / DS4Windows / DSX, can become player 2: set
-  **Controllers** to **All on player 1**.
+  **Controls** > **Controllers** to **All on player 1**.
 - **Disc image somewhere else?** If there's no `.iso` in the folder, the game asks for one the first
   time and remembers it.
-- **Keyboard controls** are included but not tested yet (a controller is recommended). The default
-  layout (rebind with **F4** in game):
+- **Keyboard and mouse:** **Keyboard controls** are on from the start (**F1** > **Controls**). Set
+  your keys in **Controls** > **Keyboard & mouse setup**, with the mouse, the keyboard or a
+  controller: two keys for each controller button, mouse buttons too, and the mouse as the right
+  stick with its sensitivity. Picking a key another button uses swaps the two, F1 and the other
+  hotkeys can't be bound, and **Reset to defaults** puts everything back. The game's button prompts
+  show your keys. The default layout:
 
 | Controller | Keyboard | | Controller | Keyboard |
 |---|---|---|---|---|
@@ -104,7 +128,7 @@ ID `31981C72`, about 7.8 GB).
 | B | Backspace / ' | | Right stick | Arrow keys |
 | X | L | | D-pad | Shift + arrow keys |
 | Y | P | | LB / RB | 1 / 3 |
-| Start | Enter / X | | LT / RT | Q / E |
+| Start | Enter / X | | LT / RT | Q / E (or I / O) |
 | Back | Tab / Z | | Stick presses | F / K |
 
 Shift, Ctrl and Alt work as buttons too (for example Shift to run). A key bound on its own like
@@ -146,7 +170,7 @@ Open the settings menu, go to **Update** and press **A** to see what's new, **A*
 then **Restart now**. Your `userdata` (saves, profiles, created superstars), settings and disc image
 are kept, and your saves are also copied to `save_backups` first; if anything goes wrong, the version
 you had is put back. **Check for updates: Off** keeps the game offline (the check only asks GitHub
-for the latest release). Coming from v0.1? Download the new zip once by hand.
+for the latest release).
 
 ## Troubleshooting
 
@@ -155,7 +179,10 @@ for the latest release). Coming from v0.1? Download the new zip once by hand.
 | A window asks for a disc image | There's no `.iso` next to `svr2007.exe`: pick your disc image (it's remembered), or copy it into the game's folder. |
 | The game closes right after starting | Check that your disc image is the USA / Europe release of SvR 2007 and complete. |
 | Black screen, or the game closes | Update your graphics driver. Still happening: **F1** > *Graphics API* > the other one (or add `svr_graphics_api = "vulkan"` to `svr2007.toml`) and start again. |
-| It runs slowly | Get the latest version. **F1** > *CPU priority* > **High** helps on a busy or weak PC; on a weak graphics card, **F1** > *Resolution* > **720p** (from the next start). |
+| It runs slowly | Get the latest version. **F1** > *CPU priority* > **High** helps on a busy or weak PC; on a weak graphics card, **F1** > *Resolution* > **720p** or **480p** (from the next start). |
+| The on-screen buttons are the wrong ones | **F1** > *Controls* > *Button prompts*: Auto follows what you played with last; pick **Xbox**, **PlayStation** or **Keyboard** to keep one (Steam Input can make a PlayStation controller look like an Xbox one). |
+| Playing alone, the game says player 2 is disconnected | **F1** > *Controls* > *Controllers* > **All on player 1**. |
+| The keyboard does nothing | **F1** > *Controls* > *Keyboard controls* > **On**. |
 
 Still stuck? [Open an issue](https://github.com/nefariousjosiah/WWE-SVR2007-RECOMP/issues) with
 `game.log` from the game's folder, your processor and graphics card.
@@ -178,6 +205,10 @@ Still stuck? [Open an issue](https://github.com/nefariousjosiah/WWE-SVR2007-RECO
 - **Loading.** The console paced its loading thread to the screen: a sleep before every step and
   the graphics device shared only between frames. Outside matches, the port lets loading run without
   those waits.
+- **Button prompts.** The game draws its buttons from textures. When PlayStation or keyboard
+  buttons are wanted, the renderer swaps the Xbox buttons on them for the port's own drawings
+  (PS3-style buttons, or key caps drawn from your bindings) as they load, and again when you
+  switch.
 - **Languages.** The disc has the game's text in English and Italian, but the game always picked
   English; the port keeps Italian when you choose it.
 
@@ -239,8 +270,8 @@ re:Blue's renderer core (BSD 3-Clause) and the other projects in [THIRD_PARTY.md
 which keep their own licences; the releases include FFmpeg and libmspack under the LGPL (their
 source: see THIRD_PARTY.md). None of the files from the game disc are in this repository or the
 releases: the game's data (models, textures, sound, video) comes from your own disc image. The
-releases do contain the game's program in recompiled form (`svr2007.exe`, with the game's shaders
-converted for PC).
+releases do contain the game's program in recompiled form (`svr2007.exe` and `svr2007_vulkan.exe`,
+with the game's shaders converted for PC).
 
 WWE, SmackDown vs. Raw and all related names, characters, content and the gameplay shown in the
 showcase clips belong to their respective owners (WWE, THQ, Yuke's); the clips are used only to show

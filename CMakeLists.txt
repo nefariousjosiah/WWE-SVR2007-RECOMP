@@ -4,7 +4,7 @@
 
 cmake_minimum_required(VERSION 3.25)
 # The release version (shown in the in-game settings menu; package_release.ps1 uses it too).
-project(svr2007 VERSION 2.2.2 LANGUAGES CXX)
+project(svr2007 VERSION 3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -25,6 +25,9 @@ set(SVR2007_SOURCES
     src/unlock_all.cpp
     src/widescreen.cpp
     src/timer_resolution.cpp
+    src/pad_icons.cpp
+    src/key_glyphs.cpp
+    src/skip_intros.cpp
     src/updater.cpp
 )
 
@@ -48,7 +51,8 @@ endif()
 # stb_image's zlib decoder, both header-only and already in the SDK's third-party tree.
 target_include_directories(svr2007 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/rexglue-sdk/thirdparty/inja/third_party/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/rexglue-sdk/thirdparty/stb)
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/rexglue-sdk/thirdparty/stb
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/rexglue-sdk/thirdparty/imgui)
 
 # Developer call census of the D3D library functions, for native
 # renderer reverse engineering. Off by default; never ship a build with it on.

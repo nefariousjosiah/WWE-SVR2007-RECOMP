@@ -138,7 +138,7 @@ index 696ff48..17412e9 100644
    std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> uniform_buffer_pool_;
  
 diff --git a/include/rex/input/input_system.h b/include/rex/input/input_system.h
-index 1cb3faa..f188cde 100644
+index 1cb3faa..75fd1f1 100644
 --- a/include/rex/input/input_system.h
 +++ b/include/rex/input/input_system.h
 @@ -11,6 +11,7 @@
@@ -160,6 +160,18 @@ index 1cb3faa..f188cde 100644
    std::vector<std::unique_ptr<InputDriver>> drivers_;
  
    std::unique_ptr<DeviceAssignment> assignment_;
+@@ -71,4 +76,11 @@ class InputSystem : public system::IInputSystem {
+ /// In tool mode, only the NOP driver is added.
+ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode);
+ 
++// SvR: which kind of gamepad the player is using (for the button pictures the game shows): the one
++// that last had a button pressed or a stick or trigger moved, else the one connected last. The
++// keyboard (and mouse) counts as one when its controller emulation (mnk_mode) gives a press.
++enum class PadFamily : int { kNone = 0, kXbox = 1, kPlayStation = 2, kKeyboard = 3 };
++PadFamily LastUsedPadFamily();
++void NoteKeyboardUsed();
++
+ }  // namespace rex::input
 diff --git a/include/rex/ui/d3d12/d3d12_util.h b/include/rex/ui/d3d12/d3d12_util.h
 index 364690d..0b88d80 100644
 --- a/include/rex/ui/d3d12/d3d12_util.h
@@ -728,10 +740,18 @@ index 813bb1c..173ee69 100644
      return X_ERROR_DEVICE_NOT_CONNECTED;
    }
 diff --git a/src/input/mnk/mnk_input_driver.cpp b/src/input/mnk/mnk_input_driver.cpp
-index 3f9422d..3ab9bd8 100644
+index 3f9422d..842cd0c 100644
 --- a/src/input/mnk/mnk_input_driver.cpp
 +++ b/src/input/mnk/mnk_input_driver.cpp
-@@ -21,7 +21,10 @@
+@@ -12,6 +12,7 @@
+ 
+ #include <rex/cvar.h>
+ #include <rex/input/input.h>
++#include <rex/input/input_system.h>
+ #include <rex/logging.h>
+ #include <rex/ui/keybinds.h>
+ #include <rex/ui/virtual_key.h>
+@@ -21,7 +22,10 @@
  #include <cmath>
  #include <cstdlib>
  #include <cstring>
@@ -742,7 +762,7 @@ index 3f9422d..3ab9bd8 100644
  
  REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller emulation");
  REXCVAR_DEFINE_BOOL(mnk_mouse, false, "Input",
-@@ -66,15 +69,31 @@ namespace {
+@@ -66,15 +70,31 @@ namespace {
  constexpr rex::input::DeviceId kMnkDevice = static_cast<rex::input::DeviceId>(0x4D4E4B00);
  
  // Bind values are a comma-separated list of alternatives, each optionally
@@ -779,7 +799,7 @@ index 3f9422d..3ab9bd8 100644
  uint8_t LiveModifiers(const bool (&key_down)[256]) {
    uint8_t mods = 0;
    if (key_down[static_cast<uint16_t>(rex::ui::VirtualKey::kShift)])
-@@ -122,18 +141,95 @@ std::string_view TrimSpaces(std::string_view s) {
+@@ -122,18 +142,95 @@ std::string_view TrimSpaces(std::string_view s) {
    return s;
  }
  
@@ -883,7 +903,7 @@ index 3f9422d..3ab9bd8 100644
  
  std::atomic<bool> mouse_look_active{true};
  
-@@ -200,25 +296,6 @@ bool MnkInputDriver::IsEnabled() const {
+@@ -200,25 +297,6 @@ bool MnkInputDriver::IsEnabled() const {
    return REXCVAR_GET(mnk_mode);
  }
  
@@ -909,7 +929,7 @@ index 3f9422d..3ab9bd8 100644
  void MnkInputDriver::EnumerateDevices(std::vector<DeviceInfo>& out) {
    // Disabled means no device at all, so it never occupies a guest user slot.
    if (!IsEnabled()) {
-@@ -274,61 +351,97 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
+@@ -274,61 +352,97 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
  
    std::lock_guard lock(state_mutex_);
  
@@ -1032,6 +1052,110 @@ index 3f9422d..3ab9bd8 100644
      ry -= INT16_MAX;
  
    if (REXCVAR_GET(mnk_mouse) && IsMouseLookActive()) {
+@@ -348,6 +462,9 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
+   };
+ 
+   packet_number_++;
++  // SvR: the keyboard is the controller in use (input_system.h), for the button pictures.
++  if (buttons || lt || rt || lx || ly || rx || ry)
++    NoteKeyboardUsed();
+ 
+   if (out_state) {
+     out_state->packet_number = packet_number_;
+diff --git a/src/input/sdl/sdl_input_driver.cpp b/src/input/sdl/sdl_input_driver.cpp
+index c7c440d..e71c83d 100644
+--- a/src/input/sdl/sdl_input_driver.cpp
++++ b/src/input/sdl/sdl_input_driver.cpp
+@@ -10,12 +10,14 @@
+  */
+ 
+ #include <array>
++#include <atomic>
+ #include <filesystem>
+ 
+ #include <rex/assert.h>
+ #include <rex/chrono/clock.h>
+ #include <rex/cvar.h>
+ #include <rex/input/flags.h>
++#include <rex/input/input_system.h>
+ #include <rex/input/sdl/sdl_input_driver.h>
+ #include <rex/logging.h>
+ #include <rex/ui/virtual_key.h>
+@@ -23,6 +25,38 @@
+ REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
+                       "Path to SDL gamecontroller mappings file");
+ 
++namespace rex::input {
++
++namespace {
++// SvR (input_system.h): the family of the gamepad used last.
++std::atomic<int> g_last_pad_family{int(PadFamily::kNone)};
++
++PadFamily FamilyOf(SDL_Gamepad* gamepad) {
++  switch (SDL_GetGamepadType(gamepad)) {
++    case SDL_GAMEPAD_TYPE_PS3:
++    case SDL_GAMEPAD_TYPE_PS4:
++    case SDL_GAMEPAD_TYPE_PS5:
++      return PadFamily::kPlayStation;
++    default:
++      return PadFamily::kXbox;
++  }
++}
++
++void NotePadFamily(SDL_Gamepad* gamepad) {
++  g_last_pad_family.store(int(FamilyOf(gamepad)), std::memory_order_relaxed);
++}
++}  // namespace
++
++PadFamily LastUsedPadFamily() {
++  return PadFamily(g_last_pad_family.load(std::memory_order_relaxed));
++}
++
++void NoteKeyboardUsed() {
++  g_last_pad_family.store(int(PadFamily::kKeyboard), std::memory_order_relaxed);
++}
++
++}  // namespace rex::input
++
+ namespace rex::input::sdl {
+ 
+ namespace {
+@@ -460,6 +494,7 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
+   // SDL_GetGamepadPlayerIndex is deliberately ignored: on Windows it reports
+   // the XInput user index the OS assigned, which is unrelated to connection
+   // order and leaves non-XInput pads unnumbered.
++  NotePadFamily(controller);  // SvR: until a pad is used, the one connected last
+   ControllerState state = {};
+   state.sdl = controller;
+   state.id = AllocateDeviceId();
+@@ -482,6 +517,9 @@ void SDLInputDriver::OnControllerDeviceRemovedLocked(const SDL_Event& event) {
+   }
+   SDL_CloseGamepad(controllers_.at(*idx).sdl);
+   controllers_.erase(controllers_.begin() + static_cast<ptrdiff_t>(*idx));
++  // SvR: the pictures follow a pad still connected (none left: as they were).
++  if (!controllers_.empty())
++    NotePadFamily(controllers_.back().sdl);
+ 
+   // LEDs only. Guest user assignment does not shift, because InputSystem holds
+   // each device's ordinal.
+@@ -522,6 +560,9 @@ void SDLInputDriver::OnControllerDeviceAxisMotionLocked(const SDL_Event& event)
+       break;
+   }
+   controllers_.at(*idx).state_changed = true;
++  // SvR: a stick pushed or a trigger pulled (not resting jitter) makes this the pad in use.
++  if (event.gaxis.value > 16000 || event.gaxis.value < -16000)
++    NotePadFamily(controllers_.at(*idx).sdl);
+ }
+ 
+ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& event) {
+@@ -577,6 +618,7 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
+   auto xbutton = xbutton_lookup.at(event.gbutton.button);
+   // Pressed or released?
+   if (event.gbutton.down) {
++    NotePadFamily(controller.sdl);  // SvR: the pad in use
+     if (xbutton == X_INPUT_GAMEPAD_GUIDE && !REXCVAR_GET(guide_button)) {
+       return;
+     }
 diff --git a/src/kernel/xam/apps/xmp_app.cpp b/src/kernel/xam/apps/xmp_app.cpp
 index a5e9088..27a023d 100644
 --- a/src/kernel/xam/apps/xmp_app.cpp

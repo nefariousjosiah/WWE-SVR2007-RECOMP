@@ -31,6 +31,9 @@
 #include "gpu/host_resource_heap.h"
 #include "gpu/texture_upload.h"
 #if defined(SVR_NATIVE_RENDERER)
+#include "../../pad_icons.h"
+#endif
+#if defined(SVR_NATIVE_RENDERER)
 #include "svr_geometry.h"
 #endif
 
@@ -427,7 +430,34 @@ bool IsPacked16(xe::TextureFormat format) {
          format == xe::TextureFormat::k_4_4_4_4;
 }
 
-GuestTexture *BuildPacked16Mirror(const MirrorLayout &L, const std::vector<u8> &staging) {
+// The game's 16- and 32-bit colour pictures with Xbox buttons, with PlayStation buttons when those
+// are wanted (pad_icons.h). `texels`: RGBA8 in the texture's component order (x to w), `row` bytes
+// a row, changed in place. pad_icons sees the picture as the game samples it, so the fetch's
+// swizzle is applied for it and undone after (the mirror's view applies it when drawing).
+void PadIconsColourPicture(const MirrorLayout &L, const xe::xe_gpu_texture_fetch_t &fetch,
+                           u32 guest_va, const std::vector<u8> &staging, u8 *texels, u32 row) {
+  u32 from[4];  // each sampled channel's source: 0-3 the components, 4 zero, 5 one
+  for (u32 c = 0; c < 4; ++c)
+    from[c] = (fetch.swizzle >> (3 * c)) & 7u;
+  const auto texel = [&](u32 i) { return texels + size_t(i / L.width) * row + (i % L.width) * 4u; };
+  std::vector<u8> rgba;
+  const auto decode = [&](std::vector<u8> &out) {
+    out.resize(size_t(L.width) * L.height * 4u);
+    for (u32 i = 0; i < L.width * L.height; ++i)
+      for (u32 c = 0; c < 4; ++c)
+        out[size_t(i) * 4 + c] = from[c] < 4 ? texel(i)[from[c]] : from[c] == 5 ? 255 : 0;
+  };
+  if (!svr::PadIconsColour(guest_va, L.width, L.height, L.bytes_per_block, staging.data(),
+                           L.staging_row_bytes, decode, rgba))
+    return;
+  for (u32 i = 0; i < L.width * L.height; ++i)
+    for (u32 c = 0; c < 4; ++c)
+      if (from[c] < 4)
+        texel(i)[from[c]] = rgba[size_t(i) * 4 + c];
+}
+
+GuestTexture *BuildPacked16Mirror(const MirrorLayout &L, const std::vector<u8> &staging,
+                                  const xe::xe_gpu_texture_fetch_t &fetch, u32 guest_va) {
   const u32 row = rex::align(L.width * 4u, 256u);
   std::vector<u8> rgba(size_t(row) * L.height, 0u);
   const auto expand5 = [](u32 c) { return u8((c << 3) | (c >> 2)); };
@@ -460,6 +490,7 @@ GuestTexture *BuildPacked16Mirror(const MirrorLayout &L, const std::vector<u8> &
       }
     }
   }
+  PadIconsColourPicture(L, fetch, guest_va, staging, rgba.data(), row);
   return BuildBCMirrorTexture(L.width, L.height, u32(xe::TextureFormat::k_8_8_8_8), rgba.data(),
                               rgba.size(), row, row / 4u);
 }
@@ -472,7 +503,7 @@ GuestTexture *Build2DMirror(const MirrorLayout &L, const u8 *src,
   UntileFace(L, src, staging.data(), L.pack_off_x, L.pack_off_y);
 #if defined(SVR_NATIVE_RENDERER)
   if (IsPacked16(L.format)) {
-    GuestTexture *tex = BuildPacked16Mirror(L, staging);
+    GuestTexture *tex = BuildPacked16Mirror(L, staging, fetch, guest_va);
     if (!tex)
       BD_WARN("native texture va=0x{:08X}: 16-bit mirror build failed ({}x{} fmt=0x{:X})",
               guest_va, L.width, L.height, u32(L.format));
@@ -481,6 +512,28 @@ GuestTexture *Build2DMirror(const MirrorLayout &L, const u8 *src,
 #endif
 
 #if defined(SVR_NATIVE_RENDERER)
+  // The game's button icon page, with PlayStation buttons when those are wanted (pad_icons.h).
+  if (L.format == xe::TextureFormat::k_DXT4_5) {
+    std::vector<u8> rgba;
+    if (svr::PadIconsPage(guest_va, L.width, L.height, staging.data(), L.staging_row_bytes, rgba)) {
+      // Rows 256-byte aligned for the copy (a picture under 64 texels wide has shorter ones).
+      const u32 row = rex::align(L.width * 4u, 256u);
+      if (row != L.width * 4u) {
+        std::vector<u8> rows(size_t(row) * L.height, 0u);
+        for (u32 y = 0; y < L.height; ++y)
+          std::memcpy(rows.data() + size_t(y) * row, rgba.data() + size_t(y) * L.width * 4u,
+                      L.width * 4u);
+        rgba.swap(rows);
+      }
+      if (GuestTexture *icons = BuildBCMirrorTexture(L.width, L.height,
+                                                     u32(xe::TextureFormat::k_8_8_8_8),
+                                                     rgba.data(), rgba.size(), row, row / 4u))
+        return icons;
+    }
+  }
+  // 32-bit colour pictures with Xbox buttons (16-bit ones: BuildPacked16Mirror).
+  if (L.format == xe::TextureFormat::k_8_8_8_8)
+    PadIconsColourPicture(L, fetch, guest_va, staging, staging.data(), L.staging_row_bytes);
   // Dev switch: SVR_MIRROR_NO_MIPS=1 mirrors the base level only (to isolate mip decoding).
   static const bool no_mips = [] {
     const char *env = std::getenv("SVR_MIRROR_NO_MIPS");

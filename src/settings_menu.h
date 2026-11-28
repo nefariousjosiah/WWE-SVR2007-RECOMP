@@ -22,6 +22,7 @@
 #include <utility>
 #include <vector>
 
+#include "keyboard_setup.h"
 #include "updater.h"
 
 #if defined(_WIN32)
@@ -51,6 +52,8 @@ class SettingsMenuDialog : public rex::ui::ImGuiDialog {
     // What the Auto choices pick on this PC ("1440p", "Direct3D 12"), shown as "Auto (1440p)".
     std::function<std::string()> auto_resolution;
     std::function<std::string()> auto_graphics_api;
+    // The game's window: the Keyboard & mouse page reads the keys for a binding from it.
+    rex::ui::Window* window = nullptr;
   };
 
   SettingsMenuDialog(rex::ui::ImGuiDrawer* drawer, std::string title, std::filesystem::path toml,
@@ -87,6 +90,10 @@ class SettingsMenuDialog : public rex::ui::ImGuiDialog {
       auto_opened = true;
       Open();
     }
+    if (controls_.DevAutoOpen()) {  // the Controls page's own
+      Open();
+      controls_.Open();
+    }
     if (!open_) {
       if (hold_ && !pad.any)
         hold_ = false;
@@ -116,8 +123,8 @@ class SettingsMenuDialog : public rex::ui::ImGuiDialog {
     kSound,
     kLanguage,
     kUnlockAll,
-    kKeyboard,
-    kControllers,
+    kIntros,
+    kControls,
     kPriority,
     kCheckUpdates,
     kUpdate,
@@ -130,8 +137,8 @@ class SettingsMenuDialog : public rex::ui::ImGuiDialog {
     const char* hint;
   };
   struct Pad {
-    bool up = false, down = false, left = false, right = false, a = false, b = false, combo = false,
-         any = false;
+    bool up = false, down = false, left = false, right = false, a = false, b = false, x = false,
+         combo = false, any = false;
   };
   using Clock = std::chrono::steady_clock;
 
@@ -172,13 +179,13 @@ class SettingsMenuDialog : public rex::ui::ImGuiDialog {
          "the Shop (shows from the next menu screen). Best treated as permanent: switching it "
          "off brings back your own progress, but rewards you earn while it's on are not saved, "
          "so you'd lose them."},
-        {"Keyboard controls", {"On", "Off"},
-         "The keyboard works as a controller (rebind keys with F4). Not tested yet: a controller is "
-         "recommended."},
-        {"Controllers", {"Separate players", "All on player 1"},
-         "Separate players: each controller is its own player, for local multiplayer. All on "
-         "player 1: every controller controls player 1. If your controller stops responding "
-         "or the game says player 2 disconnected while you play alone, choose this."},
+        {"Intros", {"On (original)", "Skip to title screen"},
+         "What the game shows when it starts. On shows the legal screen and the logo and opening "
+         "movies as the console did; Skip to title screen leaves them out. Applies the next time "
+         "you start the game."},
+        {"Controls", {},
+         "Button prompts, keyboard controls, controllers, and the keys and mouse for the "
+         "keyboard. Press A to open."},
         {"CPU priority", {"Normal", "High (busy or weak PCs)"},
          "High lets the game go first when other programs (browser, recording, downloads) want "
          "the processor too: fewer frame drops on busy or weak PCs. Those programs get less."},
@@ -206,15 +213,18 @@ class SettingsMenuDialog : public rex::ui::ImGuiDialog {
     values_[kSound] = Get("audio_mute") == "true" ? 1 : 0;
     values_[kLanguage] = LanguageRow(std::atoi(Get("user_language").c_str()));
     values_[kUnlockAll] = Get("svr_unlock_all") == "true" ? 1 : 0;
-    values_[kKeyboard] = Get("mnk_mode") == "true" ? 0 : 1;
-    values_[kControllers] = Get("svr_controllers_shared") == "true" ? 1 : 0;
+    values_[kIntros] = Get("svr_skip_intros") == "true" ? 1 : 0;
     values_[kPriority] = Get("svr_high_priority") == "true" ? 1 : 0;
     values_[kCheckUpdates] = Get("svr_check_updates") == "false" ? 1 : 0;
     confirm_update_ = false;
+    controls_.Close();
+    svr::ControlsPage::MenuShown(true);
   }
   void Close() {
     open_ = false;
     hold_ = true;
+    controls_.Close();
+    svr::ControlsPage::MenuShown(false);
   }
 
   static std::string Get(const char* name) { return rex::cvar::GetFlagByName(name); }
@@ -296,13 +306,8 @@ class SettingsMenuDialog : public rex::ui::ImGuiDialog {
       case kUnlockAll:
         Set("svr_unlock_all", v == 1 ? "true" : "false");
         break;
-      case kKeyboard:
-        Set("mnk_mode", v == 0 ? "true" : "false");
-        break;
-      case kControllers:
-        Set("svr_controllers_shared", v == 1 ? "true" : "false");
-        if (hooks_.set_controllers_shared)
-          hooks_.set_controllers_shared(v == 1);
+      case kIntros:
+        Set("svr_skip_intros", v == 1 ? "true" : "false");
         break;
       case kPriority:
         Set("svr_high_priority", v == 1 ? "true" : "false");
@@ -578,7 +583,7 @@ class SettingsMenuDialog : public rex::ui::ImGuiDialog {
   }
 
   void Change(int delta) {
-    if (selected_ >= kUpdate)
+    if (selected_ == kControls || selected_ >= kUpdate)
       return;
     confirm_restart_ = false;
     const int count = int(Rows()[selected_].labels.size());
@@ -593,13 +598,14 @@ class SettingsMenuDialog : public rex::ui::ImGuiDialog {
     constexpr int kDead = 16000;
     auto add = [&p](uint16_t b, int lx, int ly) {
       // XInput's button bits: DPAD up/down/left/right 0x1/0x2/0x4/0x8, START 0x10, BACK 0x20,
-      // A 0x1000, B 0x2000.
+      // A 0x1000, B 0x2000, X 0x4000.
       p.up |= (b & 0x0001) || ly > kDead;
       p.down |= (b & 0x0002) || ly < -kDead;
       p.left |= (b & 0x0004) || lx < -kDead;
       p.right |= (b & 0x0008) || lx > kDead;
       p.a |= (b & 0x1000) != 0;
       p.b |= (b & 0x2000) != 0;
+      p.x |= (b & 0x4000) != 0;
       p.combo |= (b & 0x0020) && (b & 0x0010);
       p.any |= b != 0 || ly > kDead || ly < -kDead || lx > kDead || lx < -kDead;
     };
@@ -636,6 +642,10 @@ class SettingsMenuDialog : public rex::ui::ImGuiDialog {
   }
 
   void HandleInput(const Pad& pad) {
+    if (controls_.IsOpen()) {
+      controls_.Input({pad.up, pad.down, pad.left, pad.right, pad.a, pad.b, pad.x});
+      return;
+    }
     const bool up = Fire(pad.up, last_.up, rep_[0]) || ImGui::IsKeyPressed(ImGuiKey_UpArrow);
     const bool down = Fire(pad.down, last_.down, rep_[1]) || ImGui::IsKeyPressed(ImGuiKey_DownArrow);
     const bool left = Fire(pad.left, last_.left, rep_[2]) || ImGui::IsKeyPressed(ImGuiKey_LeftArrow);
@@ -663,6 +673,8 @@ class SettingsMenuDialog : public rex::ui::ImGuiDialog {
         UpdateAction();
       else if (selected_ == kLanguage)
         LanguageAction();
+      else if (selected_ == kControls)
+        controls_.Open();
       else
         Change(+1);
     }
@@ -716,6 +728,10 @@ class SettingsMenuDialog : public rex::ui::ImGuiDialog {
   }
 
   void Draw(ImGuiIO& io) {
+    if (controls_.IsOpen()) {
+      controls_.Draw(io, g_menu_font);
+      return;
+    }
     const float s = std::max(0.6f, io.DisplaySize.y / 1080.0f);
     const ImU32 accent = IM_COL32(214, 38, 38, 255);
     const ImU32 text = IM_COL32(236, 238, 244, 255);
@@ -744,7 +760,11 @@ class SettingsMenuDialog : public rex::ui::ImGuiDialog {
       ImGui::PopFont();
       ImGui::Dummy(ImVec2(0, 12 * s));
 
-      const float row_h = 40 * s;
+      // Rows a little lower when they wouldn't all fit on the screen: the rest of the menu (title,
+      // hint, credit) takes about 280 * s, plus ImGui's spacing after each item.
+      const float spacing = ImGui::GetStyle().ItemSpacing.y;
+      const float row_h =
+          std::min(40 * s, (io.DisplaySize.y - 280 * s - 14 * spacing) / float(kRows) - spacing);
       const float inner = ImGui::GetContentRegionAvail().x;
       const float value_x = 340 * s;
       // After the first press on Update: what the update changes, in place of the other rows,
@@ -771,6 +791,8 @@ class SettingsMenuDialog : public rex::ui::ImGuiDialog {
             Close();
           else if (i == kUpdate)
             UpdateAction();
+          else if (i == kControls)
+            controls_.Open();
           else
             Change(io.MousePos.x < p0.x + value_x + (inner - value_x) * 0.5f ? -1 : +1);
         } else if (hovered && (io.MouseDelta.x != 0 || io.MouseDelta.y != 0)) {
@@ -793,12 +815,13 @@ class SettingsMenuDialog : public rex::ui::ImGuiDialog {
           continue;
         }
         dl->AddText(ImVec2(p0.x + 20 * s, cy - fh * 0.5f), sel ? text : dim, row.name);
-        if (i == kUpdate) {  // a button, not a choice: no arrows
-          const std::string value = UpdateValue();
+        if (i == kUpdate || i == kControls) {  // a button, not a choice: no arrows
+          const std::string value = i == kControls ? "Open" : UpdateValue();
           const float vw = ImGui::CalcTextSize(value.c_str()).x;
           const float mid = p0.x + value_x + (inner - value_x) * 0.5f;
-          const bool ready = Updater() && (Updater()->state() == svr::Updater::State::kAvailable ||
-                                           Updater()->state() == svr::Updater::State::kInstalled);
+          const bool ready = i == kUpdate && Updater() &&
+                             (Updater()->state() == svr::Updater::State::kAvailable ||
+                              Updater()->state() == svr::Updater::State::kInstalled);
           dl->AddText(ImVec2(mid - vw * 0.5f, cy - fh * 0.5f),
                       ready ? accent : (sel ? IM_COL32(255, 255, 255, 255) : text), value.c_str());
           continue;
@@ -870,4 +893,8 @@ class SettingsMenuDialog : public rex::ui::ImGuiDialog {
   int values_[kRows] = {};
   Pad last_;
   Clock::time_point rep_[4];
+  // The Controls page (keyboard_setup.h), shown in place of the rows while it's open.
+  svr::ControlsPage controls_{
+      hooks_.window, [this](const char* key, const std::string& value) { Save(key, value); },
+      hooks_.set_controllers_shared};
 };

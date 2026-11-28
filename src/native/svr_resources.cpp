@@ -26,6 +26,7 @@
 #include "gpu/output.h"
 #include "gpu/resources.h"
 #include "gpu/vertex_declaration.h"
+#include "../pad_icons.h"
 #include "svr_frame_diag.h"
 
 // src/native/crash_trace.cpp: hang watchdog, fed once per presented frame.
@@ -501,6 +502,14 @@ void SvrOnFrame() {
     BD_INFO("SvR native: frames now drawn {:.3f} wide, {:.3f} tall", wide, tall);
   g_frame_wide.store(wide, std::memory_order_relaxed);
   g_frame_tall.store(tall, std::memory_order_relaxed);
+  // The button icon pages, built again when the wanted buttons changed (pad_icons.h). Their checks
+  // go too: the content is unchanged, so a check still holding the evicted mirror would hand it
+  // out again (never rebuilt, and used after it's freed).
+  for (u32 page : svr::PadIconsStalePages()) {
+    EvictNativeTexture(page);
+    std::lock_guard lock(g_mutex);
+    g_mirror_checks.erase(page);
+  }
   // Present rate in the log every 600 frames (pacing check).
   static auto last = std::chrono::steady_clock::now();
   if (frame % 600 == 0) {

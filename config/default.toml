@@ -84,6 +84,20 @@ name = "SvrCameraAspectHook"
 address = 0x82441AB0
 registers = ["f1", "f2"]
 
+# Skip intros (src/skip_intros.cpp): the legal screen's shown state (sub_821AE740) has just counted
+# a frame and is about to compare it with its 300-frame minimum (cmpwi r11,300).
+[[midasm_hook]]
+name = "SvrSkipIntrosLegalHook"
+address = 0x821AE748
+registers = ["r11"]
+
+# The front-end sequencer (sub_821AF638) about to store the next scene number (r11); 3 (the logo
+# movie, after the legal screen) becomes 5 (the title screen), skipping the logo and opening movies.
+[[midasm_hook]]
+name = "SvrSkipIntrosMoviesHook"
+address = 0x821AF6BC
+registers = ["r11"]
+
 [functions]
 # Branch targets analysis left outside any function (codegen UnresolvedCall).
 0x824625F0 = {}   # b from 0x824649B0

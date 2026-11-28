@@ -232,6 +232,12 @@ class Svr2007App : public rex::ReXApp {
     auto path = rex::filesystem::GetExecutableFolder() / "fonts" / "PressStart2P-Regular.ttf";
     g_fps_counter_font = nullptr;
     g_menu_font = nullptr;
+    // Roboto Medium, the in-game key pictures' font, for the key caps of the Keyboard & mouse
+    // page (keyboard_setup.h).
+    g_key_font = nullptr;
+    const auto roboto = rex::filesystem::GetExecutableFolder() / "fonts" / "Roboto-Medium.ttf";
+    if (std::filesystem::exists(roboto))
+      g_key_font = atlas->AddFontFromFileTTF(roboto.string().c_str(), 32.0f);
     if (!std::filesystem::exists(path)) {
       REXLOG_WARN("FPS counter font not found: {}", path.string());
       return;
@@ -311,6 +317,7 @@ class Svr2007App : public rex::ReXApp {
       return std::string(svr::WantsVulkan("auto") ? "Vulkan" : "Direct3D 12");
     };
 #endif
+    hooks.window = window();
     hooks.updater = [this] { return updater_.get(); };
     hooks.quit = [this] { app_context().QuitFromUIThread(); };
     // Text entry (keyboard_ui.cpp): the on-screen keyboard reads the pad the same way.

@@ -47,10 +47,10 @@ foreach ($f in "msvcp140.dll", "msvcp140_atomic_wait.dll", "vcruntime140.dll", "
 # $Title settings. Edit with any text editor; command-line arguments override these.
 fullscreen = true
 svr_60fps = true
-# Keyboard controls are not tested yet; a controller is recommended (rebind keys with F4 in game).
+# Keyboard and mouse: set your keys in the settings menu (F1 > Controls > Keyboard & mouse setup).
 mnk_mode = true
 # Internal resolution: 0 = auto (1440p on 1080p/1440p screens, 4K on 4K screens, 720p on
-# Steam Deck), 1 = 720p (original), 2 = 1440p, 3 = 4K, 6 = 8K, or a height: 480, 1080.
+# Steam Deck and built-in laptop graphics), 1 = 720p (original), 2 = 1440p, 3 = 4K, 6 = 8K, or a height: 480, 1080.
 svr_render_scale = 0
 # Screen shape: 5 = the game's 16:9 (thin bars on 16:10 screens such as the Steam Deck),
 # 6 = stretch to fill.
@@ -82,7 +82,7 @@ Linux / Steam Deck, through Proton
 
 Settings: press F1 in game (or Back + Start on a controller) for the settings menu: resolution
 from 480p up to 8K, graphics API, fullscreen or window, 60 or 30 fps, screen shape, background blur, FPS counter, sound,
-language (English, Italian), unlock everything, keyboard controls, CPU priority. Saved in $Id.toml.
+language (English, Italian), unlock everything, intros, controls (button prompts, keyboard and mouse keys, controllers), CPU priority. Saved in $Id.toml.
 Graphics: $Id.exe draws with Direct3D 12 on Windows; on Steam Deck / Linux it starts
 $($Id)_vulkan.exe (Vulkan) by itself. Settings > Graphics API switches between them.
 Saves: the userdata folder (created on first start). If something goes wrong, send game.log.
